@@ -28,28 +28,24 @@ Deno.serve(async (req) => {
   }
 
   const secret = Deno.env.get("RELAY_SECRET");
-
+  
   if (!secret) {
-    console.error("RELAY_SECRET is not configured");
     return new Response("Service unavailable", { status: 503 });
   }
-
- const segments = url.pathname.split("/").filter(Boolean);
-
-  return Response.json(
-    {
-      method: req.method,
-      firstSegment: segments[0] ?? null,
-      segmentCount: segments.length,
-      segmentLengths: segments.map((s) => s.length),
-      redactedPath: url.pathname.replace(secret, "<RELAY_SECRET>"),
-    },
-    { status: 418 },
-  ); 
-
+  
+  const validPaths = new Set([
+    `/${secret}/responses`,     // Deno直叩き用
+    `/v1/${secret}/responses`,  // Cloudflare AI Gateway経由
+  ]);
+  
+  if (!validPaths.has(url.pathname)) {
+    return new Response("Not Found", { status: 404 });
+  }
+  
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
+
 
   const headers = new Headers(req.headers);
 
