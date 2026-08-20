@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-20
 
-**Status:** Approved for implementation planning
+**Status:** Approved design; implementation release is blocked on the required
+OpenCode plugin-runtime version capability
 
 ## Scope
 
@@ -13,8 +14,8 @@ This repository will contain two independently deployable deliverables:
 - `apps/deno-relay`: the Deno Deploy fixed-upstream egress relay.
 
 The existing `@yohi/cloudflare-ai-gateway-byok` package remains in its own
-repository. A compatible BYOK release is a mandatory release prerequisite, not
-a runtime dependency of either deliverable in this repository. Cloudflare Custom
+repository. A compatible BYOK release is a mandatory release prerequisite, not a
+runtime dependency of either deliverable in this repository. Cloudflare Custom
 Provider and Deno Deploy provisioning are operational prerequisites and out of
 scope for plugin runtime behavior.
 
@@ -25,12 +26,24 @@ scope for plugin runtime behavior.
   interception contract cannot be established, ChatGPT Codex requests fail
   closed; they never bypass the gateway.
 - The plugin release's `peerDependencies.opencode` semver range is the
-  authoritative supported-version range. At initialization, the plugin must
-  read the host OpenCode version exposed by the plugin runtime and reject
-  activation before installing the interposer when that version is absent or
-  outside the range. The published release documentation must repeat the exact
-  range. A rejected activation is a configuration error, not permission to send
-  Codex traffic directly to ChatGPT.
+  authoritative supported-version range. A released plugin requires an OpenCode
+  plugin-runtime capability that exposes the host version. This capability is an
+  upstream release prerequisite: OpenCode v1.18.19's `PluginInput` does not
+  expose it. Once available, the plugin must reject activation before installing
+  the interposer when the version capability is absent or outside the range. The
+  host capability must also block matching Codex requests in this case: rejection
+  alone cannot prevent a direct request when no interposer is installed. The
+  published release documentation must repeat the exact range. This failure mode
+  must not disable the built-in `openai` provider or a general OpenCode session,
+  because they also own OAuth and unrelated traffic. A rejected activation is a
+  configuration error, not permission to send Codex traffic directly to ChatGPT.
+- OpenCode v1.18.19's built-in `cloudflare-ai-gateway` provider is not a
+  replacement for this design. Its native `openai/*` and `anthropic/*`
+  passthroughs serve Cloudflare API-token and Unified Billing or BYOK traffic;
+  they do not reuse the ChatGPT OAuth Codex transport. ChatGPT subscription
+  traffic must retain the built-in `openai` provider and be routed only by this
+  plugin's final-request interposer. It must not select `cloudflare-ai-gateway`
+  or rewrite a pure Codex model ID to `openai/*` or `anthropic/*`.
 - Preserve OpenCode-owned OAuth, token refresh, Codex protocol, model choice,
   request payload, and response handling. Neither deliverable implements or
   stores OAuth credentials.
@@ -48,9 +61,14 @@ OpenCode built-in ChatGPT OAuth
   -> https://chatgpt.com/backend-api/codex/responses
 ```
 
-The plugin is the routing and Gateway-header layer. Cloudflare AI Gateway is
-the sole observability plane. The relay is a minimal egress transport. No path
-may fall back directly to ChatGPT when the Gateway or relay fails.
+The plugin is the routing and Gateway-header layer. Cloudflare AI Gateway is the
+sole observability plane. The relay is a minimal egress transport. No path may
+fall back directly to ChatGPT when the Gateway or relay fails.
+
+The built-in OpenCode `cloudflare-ai-gateway` provider is outside this path. It
+owns native upstream passthrough for Cloudflare-authenticated API traffic; the
+plugin continues to interpose the final request emitted by the built-in OpenAI
+ChatGPT OAuth loader.
 
 ### Package Boundaries
 
@@ -91,8 +109,8 @@ requests other than the following exact request:
 POST https://chatgpt.com/backend-api/codex/responses
 ```
 
-In particular, `auth.openai.com`, `api.openai.com`, other `chatgpt.com`
-traffic, and ChatGPT OAuth login or refresh traffic pass through unchanged.
+In particular, `auth.openai.com`, `api.openai.com`, other `chatgpt.com` traffic,
+and ChatGPT OAuth login or refresh traffic pass through unchanged.
 
 For a matching request, the plugin:
 
@@ -140,10 +158,10 @@ After authentication, the relay creates an upstream request fixed to:
 https://chatgpt.com/backend-api/codex/responses
 ```
 
-It forwards the original request body stream without parsing or buffering it.
-It retains the OAuth `Authorization`, `ChatGPT-Account-Id`, residency, and
-other Codex protocol headers. Before forwarding, it removes header names that
-match the following rules:
+It forwards the original request body stream without parsing or buffering it. It
+retains the OAuth `Authorization`, `ChatGPT-Account-Id`, residency, and other
+Codex protocol headers. Before forwarding, it removes header names that match
+the following rules:
 
 ```text
 cf-aig-*
@@ -172,16 +190,16 @@ hop-by-hop headers `keep-alive`, `proxy-authenticate`, `proxy-authorization`,
 `te`, `trailer`, `transfer-encoding`, and `upgrade`. All remaining upstream
 response headers, status, and body stream are preserved. Upstream `401`, `403`,
 `429`, and `5xx` results are pass-through responses, as are streaming SSE
-responses. The relay has no generic forwarding route, retry loop, cache,
-payload persistence, or application logging of credentials or payloads.
+responses. The relay has no generic forwarding route, retry loop, cache, payload
+persistence, or application logging of credentials or payloads.
 
 ### Relay Timeout and Cancellation Semantics
 
 The relay starts a 30-second connect-and-response-header timeout immediately
 before calling the fixed-upstream `fetch`. It covers DNS, TCP/TLS connection,
 and receipt of the complete upstream response headers. If it expires before
-headers arrive, the relay aborts the upstream request and returns `504` with
-the JSON error code `upstream_connect_or_header_timeout`.
+headers arrive, the relay aborts the upstream request and returns `504` with the
+exact JSON body `{"error":"upstream_connect_or_header_timeout"}`.
 
 After upstream headers arrive for an SSE response, the relay starts a separate
 120-second idle timer. The timer resets only when an upstream body chunk is
@@ -203,19 +221,22 @@ retry.
 
 The following values are required for matching ChatGPT Codex requests:
 
-| Setting | Resolution |
-| --- | --- |
-| Account ID | `CLOUDFLARE_ACCOUNT_ID` |
-| Gateway ID | `CLOUDFLARE_GATEWAY_ID` |
-| Gateway token | Environment, then plugin `apiKey` |
-| Relay token | Environment, then plugin `relayToken` |
-| Provider slug | Environment, plugin setting, then default |
+| Setting                | Resolution                                |
+| ---------------------- | ----------------------------------------- |
+| Account ID             | `CLOUDFLARE_ACCOUNT_ID`                   |
+| Gateway ID             | `CLOUDFLARE_GATEWAY_ID`                   |
+| Gateway token          | Environment, then plugin `apiKey`         |
+| Relay token            | Environment, then plugin `relayToken`     |
+| Provider slug          | Environment, plugin setting, then default |
 | Log payload collection | Environment, plugin setting, then default |
-| Gateway base URL | Production origin, test-only override |
+| Gateway base URL       | Production origin, test-only override     |
 
 - Account ID and Gateway ID are required.
 - Gateway token resolves from `CLOUDFLARE_API_TOKEN`, then `CF_AIG_TOKEN`, then
-  plugin `apiKey`. It is never sent past AI Gateway.
+  plugin `apiKey`. On this ChatGPT Custom Provider path, it is never sent past
+  AI Gateway. This guarantee does not describe the built-in
+  `cloudflare-ai-gateway` provider's Workers AI path, which may intentionally
+  forward its Cloudflare token upstream.
 - Relay token resolves from `CLOUDFLARE_CHATGPT_RELAY_TOKEN`, then plugin
   `relayToken`. It is never sent to ChatGPT.
 - Provider slug resolves from `CLOUDFLARE_CHATGPT_PROVIDER_SLUG`, then plugin
@@ -227,11 +248,11 @@ The following values are required for matching ChatGPT Codex requests:
   default `true` enables payload retention, which is an explicit
   privacy-relevant default.
 - The production Gateway base URL is `https://gateway.ai.cloudflare.com`.
-  `CLOUDFLARE_AIG_BASE_URL` may override it only when
-  `CLOUDFLARE_AIG_TEST_MODE` is exactly `true` and the parsed URL is the
-  allowlisted HTTPS origin `https://gateway.test.invalid`; otherwise it is a
-  matching-request configuration error. Tests should prefer fetch mocking or
-  dependency injection over this override.
+  `CLOUDFLARE_AIG_BASE_URL` may override it only when `CLOUDFLARE_AIG_TEST_MODE`
+  is exactly `true` and the parsed URL is the allowlisted HTTPS origin
+  `https://gateway.test.invalid`; otherwise it is a matching-request
+  configuration error. Tests should prefer fetch mocking or dependency injection
+  over this override.
 
 Only the three fixed metadata entries are emitted. Agent, session, account ID,
 OAuth credentials, relay credentials, prompts, and response content are never
@@ -252,9 +273,9 @@ The compatible BYOK release must restrict its `Authorization` cleanup to
 requests it creates for BYOK. It must not remove OAuth `Authorization` from the
 ChatGPT Custom Provider Gateway URL.
 
-The plugin does not take a runtime dependency on BYOK and cannot reliably
-detect a later fetch wrapper changing a request. Compatibility is therefore a
-release gate:
+The plugin does not take a runtime dependency on BYOK and cannot reliably detect
+a later fetch wrapper changing a request. Compatibility is therefore a release
+gate:
 
 - Document the minimum compatible BYOK version.
 - Run contract tests for both plugin load orders.
@@ -269,13 +290,17 @@ workaround.
 - Access tokens may traverse the Gateway and relay solely as upstream
   authentication, but are never logged, stored, included in metadata, or
   included in error messages.
-- Gateway and relay tokens are distinct credentials. The Gateway token stops at
-  Cloudflare; the relay token stops at the relay.
+- Gateway and relay tokens are distinct credentials. On this plugin's ChatGPT
+  Custom Provider path, the Gateway token stops at Cloudflare and the relay
+  token stops at the relay. The relay removes both `cf-aig-*` and `cf-*` headers
+  before forwarding to ChatGPT.
 - Gateway failures, relay failures, DNS or connection failures, timeouts, and
   all ChatGPT upstream errors are returned to OpenCode. No direct fallback is
   attempted.
 - Unsupported or unidentified OpenCode versions reject plugin activation before
-  any interposer is installed. The supported Codex endpoint remains the only
+  any interposer is installed. This guarantee requires a host capability that
+  blocks matching Codex traffic on activation rejection; until it exists, a
+  plugin release is blocked. The supported Codex endpoint remains the only
   intercepted request; OAuth and unrelated ChatGPT traffic are unaffected.
 
 ## Test Strategy
@@ -284,8 +309,13 @@ workaround.
 
 - Rewrite only the exact ChatGPT Codex responses endpoint.
 - Leave OAuth and non-ChatGPT traffic untouched.
-- Reject plugin activation for an absent or unsupported OpenCode version, and
-  prove that no unsupported Codex request can reach ChatGPT directly.
+- Require the upstream host-version capability before publishing a compatible
+  plugin release. Reject plugin activation for an absent or unsupported version,
+  prove the host blocks matching Codex traffic, and preserve the built-in
+  `openai` provider and unrelated sessions.
+- Confirm ChatGPT OAuth uses the built-in `openai` provider and this plugin's
+  final-request interposer, not the built-in `cloudflare-ai-gateway` provider or
+  its `openai/*` and `anthropic/*` native passthroughs.
 - Preserve OAuth, account, residency, and Codex headers.
 - Add each required Gateway, relay, logging, metadata, cache, and retry header.
 - Confirm the request bytes are unchanged, including pure model ID, `store`,
@@ -297,6 +327,9 @@ workaround.
 - Cover `CLOUDFLARE_AIG_COLLECT_LOG_PAYLOAD` values `true`, `false`, invalid
   input, and the unset default. Confirm that `false` is emitted as `false` and
   invalid input is a matching-request configuration error.
+- Confirm the relay removes `cf-aig-*` and `cf-*` headers so the Gateway token
+  cannot reach ChatGPT, even though the built-in Workers AI path may forward its
+  token by design.
 - Confirm diagnostics never contain credentials or payloads.
 
 ### Relay Unit Tests
@@ -323,11 +356,11 @@ workaround.
   `Authorization`.
 - Run unit, contract, typecheck, and lint suites in normal CI.
 - Run an explicit protected acceptance suite with real Cloudflare, Deno Deploy,
-  and ChatGPT OAuth credentials. It covers 200 SSE, tool calls, reasoning,
-  token refresh, representative Gateway/relay/upstream errors, both log-payload
-  modes, Gateway log creation, and the Gateway-to-relay-to-upstream path
-  mapping (`custom-{providerSlug}/v1/responses` to relay `POST /v1/responses`
-  to the fixed ChatGPT upstream).
+  and ChatGPT OAuth credentials. It covers 200 SSE, tool calls, reasoning, token
+  refresh, representative Gateway/relay/upstream errors, both log-payload modes,
+  Gateway log creation, and the Gateway-to-relay-to-upstream path mapping
+  (`custom-{providerSlug}/v1/responses` to relay `POST /v1/responses` to the
+  fixed ChatGPT upstream).
 
 ## Out of Scope
 
@@ -336,5 +369,7 @@ workaround.
 - Direct ChatGPT fallback or generic proxy behavior.
 - `octg` integration or changes.
 - Custom Provider or Deno Deploy provisioning automation.
-- A native custom Codex endpoint integration. That replaces the fetch
-  interposer only when OpenCode formally supports it.
+- Using OpenCode's built-in Cloudflare AI Gateway native passthrough for ChatGPT
+  OAuth traffic.
+- A native custom Codex endpoint integration. That replaces the fetch interposer
+  only when OpenCode formally supports it.
