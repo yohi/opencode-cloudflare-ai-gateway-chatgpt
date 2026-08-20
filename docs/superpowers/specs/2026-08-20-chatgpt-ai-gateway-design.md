@@ -31,9 +31,12 @@ scope for plugin runtime behavior.
   upstream release prerequisite: OpenCode v1.18.19's `PluginInput` does not
   expose it. Once available, the plugin must reject activation before installing
   the interposer when the version capability is absent or outside the range. The
-  published release documentation must repeat the exact range. A rejected
-  activation is a configuration error, not permission to send Codex traffic
-  directly to ChatGPT.
+  host capability must also block matching Codex requests in this case: rejection
+  alone cannot prevent a direct request when no interposer is installed. The
+  published release documentation must repeat the exact range. This failure mode
+  must not disable the built-in `openai` provider or a general OpenCode session,
+  because they also own OAuth and unrelated traffic. A rejected activation is a
+  configuration error, not permission to send Codex traffic directly to ChatGPT.
 - OpenCode v1.18.19's built-in `cloudflare-ai-gateway` provider is not a
   replacement for this design. Its native `openai/*` and `anthropic/*`
   passthroughs serve Cloudflare API-token and Unified Billing or BYOK traffic;
@@ -196,7 +199,7 @@ The relay starts a 30-second connect-and-response-header timeout immediately
 before calling the fixed-upstream `fetch`. It covers DNS, TCP/TLS connection,
 and receipt of the complete upstream response headers. If it expires before
 headers arrive, the relay aborts the upstream request and returns `504` with the
-JSON error code `upstream_connect_or_header_timeout`.
+exact JSON body `{"error":"upstream_connect_or_header_timeout"}`.
 
 After upstream headers arrive for an SSE response, the relay starts a separate
 120-second idle timer. The timer resets only when an upstream body chunk is
@@ -295,7 +298,9 @@ workaround.
   all ChatGPT upstream errors are returned to OpenCode. No direct fallback is
   attempted.
 - Unsupported or unidentified OpenCode versions reject plugin activation before
-  any interposer is installed. The supported Codex endpoint remains the only
+  any interposer is installed. This guarantee requires a host capability that
+  blocks matching Codex traffic on activation rejection; until it exists, a
+  plugin release is blocked. The supported Codex endpoint remains the only
   intercepted request; OAuth and unrelated ChatGPT traffic are unaffected.
 
 ## Test Strategy
@@ -306,7 +311,8 @@ workaround.
 - Leave OAuth and non-ChatGPT traffic untouched.
 - Require the upstream host-version capability before publishing a compatible
   plugin release. Reject plugin activation for an absent or unsupported version,
-  and prove that no unsupported Codex request can reach ChatGPT directly.
+  prove the host blocks matching Codex traffic, and preserve the built-in
+  `openai` provider and unrelated sessions.
 - Confirm ChatGPT OAuth uses the built-in `openai` provider and this plugin's
   final-request interposer, not the built-in `cloudflare-ai-gateway` provider or
   its `openai/*` and `anthropic/*` native passthroughs.
