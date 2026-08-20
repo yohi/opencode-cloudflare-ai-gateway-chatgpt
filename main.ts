@@ -34,9 +34,17 @@ Deno.serve(async (req) => {
     return new Response("Service unavailable", { status: 503 });
   }
 
-  if (url.pathname !== `/${secret}/responses`) {
-    return new Response("Not Found", { status: 404 });
-  }
+  const segments = url.pathname.split("/").filter(Boolean);
+  
+  return Response.json(
+    {
+      method: req.method,
+      segmentCount: segments.length,
+      segmentLengths: segments.map((s) => s.length),
+      lastSegment: segments.at(-1) ?? null,
+    },
+    { status: 418 },
+  );
 
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
