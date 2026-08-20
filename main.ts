@@ -34,17 +34,18 @@ Deno.serve(async (req) => {
     return new Response("Service unavailable", { status: 503 });
   }
 
-  const segments = url.pathname.split("/").filter(Boolean);
-  
+ const segments = url.pathname.split("/").filter(Boolean);
+
   return Response.json(
     {
       method: req.method,
+      firstSegment: segments[0] ?? null,
       segmentCount: segments.length,
       segmentLengths: segments.map((s) => s.length),
-      lastSegment: segments.at(-1) ?? null,
+      redactedPath: url.pathname.replace(secret, "<RELAY_SECRET>"),
     },
     { status: 418 },
-  );
+  ); 
 
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
