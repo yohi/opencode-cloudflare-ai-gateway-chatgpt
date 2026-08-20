@@ -1,0 +1,16 @@
+{
+  "model": "gpt-5.6-luna",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Say hello."
+        }
+      ]
+    }
+  ],
+  "store": false,
+  "stream": true
+}

@@ -8,6 +8,25 @@ Deno.serve(async (req) => {
     return new Response("ok", { status: 200 });
   }
 
+  if (url.pathname === "/debug-secret") {
+    const secret = Deno.env.get("RELAY_SECRET") ?? "";
+
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(secret),
+    );
+
+    const sha256 = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+
+    return Response.json({
+      configured: secret.length > 0,
+      length: secret.length,
+      sha256,
+    });
+  }
+
   const secret = Deno.env.get("RELAY_SECRET");
 
   if (!secret) {
