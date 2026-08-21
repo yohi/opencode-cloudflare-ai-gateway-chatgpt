@@ -20,3 +20,8 @@ export {
   CHATGPT_CODEX_PATHNAME,
   isChatgptCodexResponsesRequest,
 } from "./matcher.js";
+export {
+  applyControlHeaders,
+  METADATA_HEADER_VALUE,
+  rewriteCodexRequest,
+} from "./request-rewrite.js";
