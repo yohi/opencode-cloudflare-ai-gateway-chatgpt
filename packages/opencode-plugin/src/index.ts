@@ -25,3 +25,5 @@ export {
   METADATA_HEADER_VALUE,
   rewriteCodexRequest,
 } from "./request-rewrite.js";
+export { installFetchInterposer } from "./interposer.js";
+export type { ConfigResolver, FetchLike } from "./interposer.js";
