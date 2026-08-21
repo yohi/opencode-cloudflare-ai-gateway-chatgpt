@@ -275,10 +275,6 @@ Deno.test("errors an SSE stream when the idle timer expires", async () => {
   const scheduled: Scheduled[] = [];
   let nextId = 1;
   let upstreamAborted = false;
-  let releaseUpstream!: () => void;
-  const upstreamGate = new Promise<void>((resolve) => {
-    releaseUpstream = resolve;
-  });
 
   const handler = createRelayHandler({
     getSecret: () => relayToken,
@@ -287,7 +283,6 @@ Deno.test("errors an SSE stream when the idle timer expires", async () => {
         "abort",
         () => {
           upstreamAborted = true;
-          releaseUpstream();
         },
         { once: true },
       );
@@ -431,28 +426,51 @@ function createSseIdleTimeoutStream(
   },
 ): ReadableStream<Uint8Array> {
   const reader = upstreamBody.getReader();
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let streamSettled = false;
   let idleTimedOut = false;
-  let timerId = options.timer.schedule(() => {
-    idleTimedOut = true;
-    options.controller.abort();
-  }, options.idleTimeoutMs);
+  let timerId = 0;
 
   const clearIdleTimer = (): void => {
     options.timer.clear(timerId);
   };
-  const resetIdleTimer = (): void => {
+
+  const settleDownstream = (error: unknown): void => {
+    if (streamSettled || downstream === undefined) {
+      return;
+    }
+    streamSettled = true;
     clearIdleTimer();
-    timerId = options.timer.schedule(() => {
+    try {
+      downstream.error(error);
+    } catch {
+      void error;
+    }
+  };
+
+  const scheduleIdleTimer = (): number =>
+    options.timer.schedule(() => {
       idleTimedOut = true;
       options.controller.abort();
+      settleDownstream(new Error("upstream_sse_idle_timeout"));
     }, options.idleTimeoutMs);
+
+  timerId = scheduleIdleTimer();
+
+  const resetIdleTimer = (): void => {
+    clearIdleTimer();
+    timerId = scheduleIdleTimer();
   };
 
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      downstream ??= controller;
+    },
     async pull(controller) {
       try {
         const result = await reader.read();
         if (result.done) {
+          streamSettled = true;
           clearIdleTimer();
           controller.close();
           return;
@@ -460,15 +478,17 @@ function createSseIdleTimeoutStream(
         resetIdleTimer();
         controller.enqueue(result.value);
       } catch (error) {
-        clearIdleTimer();
         if (idleTimedOut) {
-          controller.error(new Error("upstream_sse_idle_timeout"));
+          settleDownstream(new Error("upstream_sse_idle_timeout"));
           return;
         }
-        controller.error(error instanceof Error ? error : new Error("upstream_stream_error"));
+        settleDownstream(
+          error instanceof Error ? error : new Error("upstream_stream_error"),
+        );
       }
     },
     async cancel(reason) {
+      streamSettled = true;
       clearIdleTimer();
       try {
         await reader.cancel(reason);
@@ -535,17 +555,22 @@ git commit -m "feat: SSEアイドルタイムアウト(120秒)を追加"
 
 **Files:**
 
-- Modify: `apps/deno-relay/relay.ts` (no changes expected — behavior already
-  provided by Task 3 wrapper plus existing signal linking)
+- Modify: `apps/deno-relay/relay.ts` — the inbound abort listener is removed in
+  the `finally` block as soon as the fetcher resolves, so post-header client
+  disconnects never reach the upstream fetch. Keep the listener attached and
+  detach it only when the SSE body settles.
 - Test: `apps/deno-relay/relay_test.ts`
 
 **Interfaces:**
 
-- Consumes: `createSseIdleTimeoutStream` cancel path, existing `request.signal`
-  → upstream `AbortController` link.
+- Consumes: `createSseIdleTimeoutStream` (extended with an optional completion
+  hook), the existing inbound `request.signal` → upstream `AbortController`
+  link.
 - Produces: verified guarantees — downstream `cancel()` cancels the upstream
-  body and aborts the upstream fetch; inbound client abort after headers aborts
-  the upstream fetch. No signature changes.
+  body and aborts the upstream fetch; the inbound client-abort listener stays
+  attached after headers arrive and is detached only when the SSE body closes,
+  errors, or is cancelled, so a late client disconnect still propagates to the
+  upstream fetch. No public signature changes.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -619,27 +644,104 @@ Deno.test("aborts upstream on late client disconnect", async () => {
   });
   const response = await handler(request);
   clientController.abort();
-  await response.body!.cancel().catch(() => undefined);
 
   assert(upstreamSignal?.aborted === true, "upstream fetch aborted by client disconnect");
 });
 ```
 
-- [ ] **Step 2: Run tests to verify they pass**
+The second test asserts immediately after `clientController.abort()` without
+cancelling the response body first, so it can only pass via the inbound abort
+listener itself — not through the wrapper's `cancel()` path.
+
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run: `deno test`
-Expected: PASS — both tests pass without further implementation changes because
-Task 3's `cancel()` path and the pre-existing `request.signal` listener already
-provide these semantics. If either fails, fix `relay.ts` minimally (e.g., ensure
-the abort listener also calls `controller.abort()` — it already does) and
-re-run.
+Expected: FAIL — `aborts upstream on late client disconnect` fails because the
+current `finally` block removes the abort listener once the fetcher resolves.
+`cancels the upstream body when the downstream cancels` already passes via the
+wrapper's `cancel()` path.
 
-- [ ] **Step 3: Verify full suite, fmt, lint and commit**
+- [ ] **Step 3: Implement the abort-listener lifetime fix in `relay.ts`**
+
+Extend `createSseIdleTimeoutStream` options with an optional completion hook:
+
+```typescript
+  options: {
+    readonly controller: AbortController;
+    readonly timer: RelayTimer;
+    readonly idleTimeoutMs: number;
+    readonly onFinished?: () => void;
+  },
+```
+
+Introduce a single settlement helper inside the function and route every
+shutdown path through it:
+
+```typescript
+  const finishStream = (): void => {
+    if (streamSettled) {
+      return;
+    }
+    streamSettled = true;
+    clearIdleTimer();
+    options.onFinished?.();
+  };
+
+  const settleDownstream = (error: unknown): void => {
+    if (downstream === undefined) {
+      return;
+    }
+    finishStream();
+    try {
+      downstream.error(error);
+    } catch {
+      void error;
+    }
+  };
+```
+
+In the `pull()` done path, replace the manual flag set and timer clear with
+`finishStream();` immediately before `controller.close();`. In `cancel()`, call
+`finishStream();` first instead of setting the flag manually.
+
+Wire the hook in `createRelayHandler` so the SSE wrapper detaches the inbound
+abort listener when its body settles:
+
+```typescript
+      const detachClientAbortListener = (): void => {
+        request.signal.removeEventListener("abort", abortForClientDisconnect);
+      };
+
+      const contentType = upstream.headers.get("content-type") ?? "";
+      const body =
+        contentType.includes(sseContentTypeMarker) && upstream.body !== null
+          ? createSseIdleTimeoutStream(upstream.body, {
+            controller,
+            timer,
+            idleTimeoutMs,
+            onFinished: detachClientAbortListener,
+          })
+          : upstream.body;
+```
+
+Remove the `removeEventListener` line from the `finally` block (keep the timer
+clear). `{ once: true }` already bounds the listener to a single invocation.
+Non-SSE responses and pre-body failure paths (504 JSON response, thrown
+fetcher error) leave the listener attached until the Request object is
+garbage-collected, which satisfies the detach-only-on-SSE-settlement rule and
+costs nothing extra at runtime.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `deno test`
+Expected: PASS — all 10 tests (5 existing + 3 from Task 3 + 2 here).
+
+- [ ] **Step 5: Verify full suite, fmt, lint and commit**
 
 ```bash
 deno test && deno fmt --check && deno lint
 git add apps/deno-relay/
-git commit -m "test: ストリーム開始後の切断キャンセル伝播を検証"
+git commit -m "fix: ヘッダー受信後のクライアント切断を上流fetchへ伝播"
 ```
 
 ---
