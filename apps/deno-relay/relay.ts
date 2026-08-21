@@ -132,7 +132,9 @@ export function createRelayHandler(
     const controller = new AbortController();
     let timedOut = false;
     const abortForClientDisconnect = (): void => controller.abort();
-    request.signal.addEventListener("abort", abortForClientDisconnect, { once: true });
+    request.signal.addEventListener("abort", abortForClientDisconnect, {
+      once: true,
+    });
     const timeoutId = timer.schedule(() => {
       timedOut = true;
       controller.abort();

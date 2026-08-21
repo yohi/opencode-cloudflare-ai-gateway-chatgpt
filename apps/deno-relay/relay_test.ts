@@ -32,15 +32,17 @@ Deno.test("forwards only authenticated requests and sanitizes hop headers", asyn
     getSecret: () => relayToken,
     fetcher: (input, init) => {
       upstreamRequest = new Request(input, init);
-      return Promise.resolve(new Response("upstream-body", {
-        headers: {
-          connection: "X-Response-Internal",
-          "X-Response-Internal": "private",
-          "content-length": "13",
-          "transfer-encoding": "chunked",
-          "X-Preserved": "yes",
-        },
-      }));
+      return Promise.resolve(
+        new Response("upstream-body", {
+          headers: {
+            connection: "X-Response-Internal",
+            "X-Response-Internal": "private",
+            "content-length": "13",
+            "transfer-encoding": "chunked",
+            "X-Preserved": "yes",
+          },
+        }),
+      );
     },
   });
 
@@ -60,18 +62,66 @@ Deno.test("forwards only authenticated requests and sanitizes hop headers", asyn
   }
 
   const upstream = upstreamRequest;
-  assertEquals(upstream.url, "https://chatgpt.com/backend-api/codex/responses", "upstream URL");
-  assertEquals(upstream.headers.get("Authorization"), "Bearer chatgpt-oauth-token", "OAuth authorization");
-  assertEquals(upstream.headers.get("ChatGPT-Account-Id"), "account-id", "account ID");
-  assertEquals(upstream.headers.get("X-ChatGPT-Relay-Authorization"), null, "relay authorization");
-  assertEquals(upstream.headers.get("cf-aig-authorization"), null, "gateway authorization");
-  assertEquals(upstream.headers.get("X-Forwarded-Host"), null, "forwarded header");
-  assertEquals(upstream.headers.get("X-Request-Internal"), null, "connection-nominated request header");
-  assertEquals(response.headers.get("connection"), null, "connection response header");
-  assertEquals(response.headers.get("X-Response-Internal"), null, "connection-nominated response header");
-  assertEquals(response.headers.get("content-length"), "13", "content length response header");
-  assertEquals(response.headers.get("transfer-encoding"), null, "hop-by-hop response header");
-  assertEquals(response.headers.get("X-Preserved"), "yes", "preserved response header");
+  assertEquals(
+    upstream.url,
+    "https://chatgpt.com/backend-api/codex/responses",
+    "upstream URL",
+  );
+  assertEquals(
+    upstream.headers.get("Authorization"),
+    "Bearer chatgpt-oauth-token",
+    "OAuth authorization",
+  );
+  assertEquals(
+    upstream.headers.get("ChatGPT-Account-Id"),
+    "account-id",
+    "account ID",
+  );
+  assertEquals(
+    upstream.headers.get("X-ChatGPT-Relay-Authorization"),
+    null,
+    "relay authorization",
+  );
+  assertEquals(
+    upstream.headers.get("cf-aig-authorization"),
+    null,
+    "gateway authorization",
+  );
+  assertEquals(
+    upstream.headers.get("X-Forwarded-Host"),
+    null,
+    "forwarded header",
+  );
+  assertEquals(
+    upstream.headers.get("X-Request-Internal"),
+    null,
+    "connection-nominated request header",
+  );
+  assertEquals(
+    response.headers.get("connection"),
+    null,
+    "connection response header",
+  );
+  assertEquals(
+    response.headers.get("X-Response-Internal"),
+    null,
+    "connection-nominated response header",
+  );
+  assertEquals(
+    response.headers.get("content-length"),
+    "13",
+    "content length response header",
+  );
+  assertEquals(
+    response.headers.get("transfer-encoding"),
+    null,
+    "hop-by-hop response header",
+  );
+  assertEquals(
+    response.headers.get("X-Preserved"),
+    "yes",
+    "preserved response header",
+  );
 });
 
 Deno.test("rejects missing or invalid relay credentials before fetching upstream", async () => {
@@ -88,11 +138,21 @@ Deno.test("rejects missing or invalid relay credentials before fetching upstream
     new Request("https://relay.example/v1/responses", { method: "POST" }),
   );
   const invalidCredentialResponse = await handler(
-    createRequest({ "X-ChatGPT-Relay-Authorization": "Bearer incorrect-token" }),
+    createRequest({
+      "X-ChatGPT-Relay-Authorization": "Bearer incorrect-token",
+    }),
   );
 
-  assertEquals(missingCredentialResponse.status, 401, "missing credential status");
-  assertEquals(invalidCredentialResponse.status, 401, "invalid credential status");
+  assertEquals(
+    missingCredentialResponse.status,
+    401,
+    "missing credential status",
+  );
+  assertEquals(
+    invalidCredentialResponse.status,
+    401,
+    "invalid credential status",
+  );
   assertEquals(fetchCalls, 0, "upstream fetch calls");
 });
 
@@ -107,7 +167,9 @@ Deno.test("rejects every route and method other than POST /v1/responses", async 
   });
 
   const wrongPathResponse = await handler(
-    new Request("https://relay.example/relay-test-token/responses", { method: "POST" }),
+    new Request("https://relay.example/relay-test-token/responses", {
+      method: "POST",
+    }),
   );
   const wrongMethodResponse = await handler(
     new Request("https://relay.example/v1/responses", { method: "GET" }),
