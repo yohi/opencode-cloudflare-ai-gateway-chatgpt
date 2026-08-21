@@ -14,3 +14,9 @@ export {
   resolveConfig,
 } from "./config.js";
 export type { EnvSource, PluginOptions, ResolvedConfig } from "./config.js";
+export { buildGatewayUrl } from "./gateway-url.js";
+export {
+  CHATGPT_CODEX_ORIGIN,
+  CHATGPT_CODEX_PATHNAME,
+  isChatgptCodexResponsesRequest,
+} from "./matcher.js";
