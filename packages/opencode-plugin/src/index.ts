@@ -1,1 +1,10 @@
-export const PLUGIN_NAME = "cloudflare-ai-gateway-chatgpt";
+export { PLUGIN_NAME } from "./core.js";
+export {
+  PluginConfigurationError,
+  UnsupportedOpenCodeVersionError,
+} from "./errors.js";
+export {
+  assertSupportedHost,
+  resolveHostVersionCapability,
+  SUPPORTED_OPENCODE_RANGE,
+} from "./host-version.js";
