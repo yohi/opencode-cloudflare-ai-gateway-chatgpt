@@ -3,6 +3,8 @@ export const UPSTREAM = "https://chatgpt.com/backend-api/codex/responses";
 const relayPath = "/v1/responses";
 const relayAuthorizationHeader = "x-chatgpt-relay-authorization";
 const upstreamHeaderTimeoutMs = 30_000;
+const sseIdleTimeoutMs = 120_000;
+const sseContentTypeMarker = "text/event-stream";
 const requestHeadersToRemove = new Set([
   "connection",
   "content-length",
@@ -43,6 +45,7 @@ export type RelayDependencies = {
   readonly getSecret: () => string | undefined;
   readonly timer?: RelayTimer;
   readonly timeoutMs?: number;
+  readonly idleTimeoutMs?: number;
 };
 
 function notFound(): Response {
@@ -105,10 +108,94 @@ function sanitizeResponseHeaders(source: Headers): Headers {
   return headers;
 }
 
+function createSseIdleTimeoutStream(
+  upstreamBody: ReadableStream<Uint8Array>,
+  options: {
+    readonly controller: AbortController;
+    readonly timer: RelayTimer;
+    readonly idleTimeoutMs: number;
+  },
+): ReadableStream<Uint8Array> {
+  const reader = upstreamBody.getReader();
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let streamSettled = false;
+  let idleTimedOut = false;
+  let timerId = 0;
+
+  const clearIdleTimer = (): void => {
+    options.timer.clear(timerId);
+  };
+
+  const settleDownstream = (error: unknown): void => {
+    if (streamSettled || downstream === undefined) {
+      return;
+    }
+    streamSettled = true;
+    clearIdleTimer();
+    try {
+      downstream.error(error);
+    } catch {
+      void error;
+    }
+  };
+
+  const scheduleIdleTimer = (): number =>
+    options.timer.schedule(() => {
+      idleTimedOut = true;
+      options.controller.abort();
+      settleDownstream(new Error("upstream_sse_idle_timeout"));
+    }, options.idleTimeoutMs);
+
+  timerId = scheduleIdleTimer();
+
+  const resetIdleTimer = (): void => {
+    clearIdleTimer();
+    timerId = scheduleIdleTimer();
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      downstream ??= controller;
+    },
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          streamSettled = true;
+          clearIdleTimer();
+          controller.close();
+          return;
+        }
+        resetIdleTimer();
+        controller.enqueue(result.value);
+      } catch (error) {
+        if (idleTimedOut) {
+          settleDownstream(new Error("upstream_sse_idle_timeout"));
+          return;
+        }
+        settleDownstream(
+          error instanceof Error ? error : new Error("upstream_stream_error"),
+        );
+      }
+    },
+    async cancel(reason) {
+      streamSettled = true;
+      clearIdleTimer();
+      try {
+        await reader.cancel(reason);
+      } catch {
+        void reason;
+      }
+      options.controller.abort();
+    },
+  });
+}
+
 export function createRelayHandler(
   dependencies: RelayDependencies,
 ): (request: Request) => Promise<Response> {
   const timeoutMs = dependencies.timeoutMs ?? upstreamHeaderTimeoutMs;
+  const idleTimeoutMs = dependencies.idleTimeoutMs ?? sseIdleTimeoutMs;
   const timer: RelayTimer = dependencies.timer ?? {
     clear: clearTimeout,
     schedule: (callback, delayMs) => Number(setTimeout(callback, delayMs)),
@@ -149,7 +236,17 @@ export function createRelayHandler(
         signal: controller.signal,
       });
 
-      return new Response(upstream.body, {
+      const contentType = upstream.headers.get("content-type") ?? "";
+      const body =
+        contentType.includes(sseContentTypeMarker) && upstream.body !== null
+          ? createSseIdleTimeoutStream(upstream.body, {
+            controller,
+            timer,
+            idleTimeoutMs,
+          })
+          : upstream.body;
+
+      return new Response(body, {
         status: upstream.status,
         headers: sanitizeResponseHeaders(upstream.headers),
       });
