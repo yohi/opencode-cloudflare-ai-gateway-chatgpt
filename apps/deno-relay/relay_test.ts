@@ -372,3 +372,81 @@ Deno.test("does not impose an idle timer on non-SSE responses", async () => {
   assertEquals(await response.text(), "upstream-body", "response body");
   assertEquals(scheduleCalls, 1, "only the header timeout was scheduled");
 });
+
+Deno.test("cancels the upstream body when the downstream cancels", async () => {
+  let upstreamCancelled = false;
+  let upstreamSignalAborted = false;
+
+  const handler = createRelayHandler({
+    getSecret: () => relayToken,
+    fetcher: (_input, init) => {
+      init?.signal?.addEventListener(
+        "abort",
+        () => {
+          upstreamSignalAborted = true;
+        },
+        { once: true },
+      );
+      const encoder = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(encoder.encode("event: response.created\n\n"));
+        },
+        cancel() {
+          upstreamCancelled = true;
+        },
+      });
+      return Promise.resolve(
+        new Response(body, {
+          headers: { "content-type": "text/event-stream" },
+        }),
+      );
+    },
+  });
+
+  const response = await handler(createRequest());
+  const reader = response.body!.getReader();
+  await reader.read();
+  await reader.cancel("client gone");
+
+  assert(upstreamCancelled, "upstream body cancelled");
+  assert(upstreamSignalAborted, "upstream fetch aborted");
+});
+
+Deno.test("aborts upstream on late client disconnect", async () => {
+  let upstreamSignal: AbortSignal | undefined;
+  const clientController = new AbortController();
+
+  const handler = createRelayHandler({
+    getSecret: () => relayToken,
+    fetcher: (_input, init) => {
+      upstreamSignal = init?.signal ?? undefined;
+      return Promise.resolve(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode("event: response.created\n\n"),
+              );
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    },
+  });
+
+  const request = new Request("https://relay.example/v1/responses", {
+    method: "POST",
+    headers: { "X-ChatGPT-Relay-Authorization": relayAuthorization },
+    body: "request-body",
+    signal: clientController.signal,
+  });
+  await handler(request);
+  clientController.abort();
+
+  assert(
+    upstreamSignal?.aborted === true,
+    "upstream fetch aborted by client disconnect",
+  );
+});

@@ -114,6 +114,7 @@ function createSseIdleTimeoutStream(
     readonly controller: AbortController;
     readonly timer: RelayTimer;
     readonly idleTimeoutMs: number;
+    readonly onFinished?: () => void;
   },
 ): ReadableStream<Uint8Array> {
   const reader = upstreamBody.getReader();
@@ -126,12 +127,20 @@ function createSseIdleTimeoutStream(
     options.timer.clear(timerId);
   };
 
-  const settleDownstream = (error: unknown): void => {
-    if (streamSettled || downstream === undefined) {
+  const finishStream = (): void => {
+    if (streamSettled) {
       return;
     }
     streamSettled = true;
     clearIdleTimer();
+    options.onFinished?.();
+  };
+
+  const settleDownstream = (error: unknown): void => {
+    if (downstream === undefined) {
+      return;
+    }
+    finishStream();
     try {
       downstream.error(error);
     } catch {
@@ -161,8 +170,7 @@ function createSseIdleTimeoutStream(
       try {
         const result = await reader.read();
         if (result.done) {
-          streamSettled = true;
-          clearIdleTimer();
+          finishStream();
           controller.close();
           return;
         }
@@ -179,8 +187,7 @@ function createSseIdleTimeoutStream(
       }
     },
     async cancel(reason) {
-      streamSettled = true;
-      clearIdleTimer();
+      finishStream();
       try {
         await reader.cancel(reason);
       } catch {
@@ -236,6 +243,10 @@ export function createRelayHandler(
         signal: controller.signal,
       });
 
+      const detachClientAbortListener = (): void => {
+        request.signal.removeEventListener("abort", abortForClientDisconnect);
+      };
+
       const contentType = upstream.headers.get("content-type") ?? "";
       const body =
         contentType.includes(sseContentTypeMarker) && upstream.body !== null
@@ -243,6 +254,7 @@ export function createRelayHandler(
             controller,
             timer,
             idleTimeoutMs,
+            onFinished: detachClientAbortListener,
           })
           : upstream.body;
 
@@ -261,7 +273,6 @@ export function createRelayHandler(
       throw error;
     } finally {
       timer.clear(timeoutId);
-      request.signal.removeEventListener("abort", abortForClientDisconnect);
     }
   };
 }
