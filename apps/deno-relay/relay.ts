@@ -112,6 +112,7 @@ function createSseIdleTimeoutStream(
   upstreamBody: ReadableStream<Uint8Array>,
   options: {
     readonly controller: AbortController;
+    readonly clientSignal: AbortSignal;
     readonly timer: RelayTimer;
     readonly idleTimeoutMs: number;
     readonly onFinished?: () => void;
@@ -122,6 +123,7 @@ function createSseIdleTimeoutStream(
   let streamSettled = false;
   let idleTimedOut = false;
   let timerId = 0;
+  let readerCancellation: Promise<void> | undefined;
 
   const clearIdleTimer = (): void => {
     options.timer.clear(timerId);
@@ -133,7 +135,24 @@ function createSseIdleTimeoutStream(
     }
     streamSettled = true;
     clearIdleTimer();
+    options.clientSignal.removeEventListener(
+      "abort",
+      cancelForClientDisconnect,
+    );
     options.onFinished?.();
+  };
+
+  const cancelReader = (reason: unknown): Promise<void> => {
+    readerCancellation ??= reader.cancel(reason).then(
+      () => undefined,
+      () => undefined,
+    );
+    return readerCancellation;
+  };
+
+  const cancelForClientDisconnect = (): void => {
+    finishStream();
+    void cancelReader(options.clientSignal.reason);
   };
 
   const settleDownstream = (error: unknown): void => {
@@ -143,8 +162,11 @@ function createSseIdleTimeoutStream(
     finishStream();
     try {
       downstream.error(error);
-    } catch {
-      void error;
+    } catch (error) {
+      if (error instanceof Error) {
+        return;
+      }
+      return;
     }
   };
 
@@ -161,6 +183,13 @@ function createSseIdleTimeoutStream(
     clearIdleTimer();
     timerId = scheduleIdleTimer();
   };
+
+  options.clientSignal.addEventListener("abort", cancelForClientDisconnect, {
+    once: true,
+  });
+  if (options.clientSignal.aborted) {
+    cancelForClientDisconnect();
+  }
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
@@ -188,11 +217,7 @@ function createSseIdleTimeoutStream(
     },
     async cancel(reason) {
       finishStream();
-      try {
-        await reader.cancel(reason);
-      } catch {
-        void reason;
-      }
+      await cancelReader(reason);
       options.controller.abort();
     },
   });
@@ -252,6 +277,7 @@ export function createRelayHandler(
         contentType.includes(sseContentTypeMarker) && upstream.body !== null
           ? createSseIdleTimeoutStream(upstream.body, {
             controller,
+            clientSignal: request.signal,
             timer,
             idleTimeoutMs,
             onFinished: detachClientAbortListener,

@@ -415,6 +415,7 @@ Deno.test("cancels the upstream body when the downstream cancels", async () => {
 
 Deno.test("aborts upstream on late client disconnect", async () => {
   let upstreamSignal: AbortSignal | undefined;
+  let upstreamCancelled = false;
   const clientController = new AbortController();
 
   const handler = createRelayHandler({
@@ -428,6 +429,9 @@ Deno.test("aborts upstream on late client disconnect", async () => {
               controller.enqueue(
                 new TextEncoder().encode("event: response.created\n\n"),
               );
+            },
+            cancel() {
+              upstreamCancelled = true;
             },
           }),
           { headers: { "content-type": "text/event-stream" } },
@@ -449,4 +453,5 @@ Deno.test("aborts upstream on late client disconnect", async () => {
     upstreamSignal?.aborted === true,
     "upstream fetch aborted by client disconnect",
   );
+  assert(upstreamCancelled, "upstream body cancelled by client disconnect");
 });
