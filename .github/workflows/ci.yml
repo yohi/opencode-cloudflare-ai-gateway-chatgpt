@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno fmt --check
+      - run: deno lint
+      - run: deno test apps/deno-relay
+
+  plugin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/opencode-plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/opencode-plugin/package-lock.json
+      - run: npm ci --legacy-peer-deps
+      - run: npm run typecheck
+      - run: npm test
