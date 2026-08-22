@@ -11,6 +11,15 @@ describe("isChatgptCodexResponsesRequest", () => {
     ).toBe(true);
   });
 
+  it("rejects the endpoint on a non-default port", () => {
+    expect(
+      isChatgptCodexResponsesRequest(
+        "POST",
+        "https://chatgpt.com:8443/backend-api/codex/responses",
+      ),
+    ).toBe(false);
+  });
+
   it("rejects other methods, hosts, schemes, paths, and queries", () => {
     expect(
       isChatgptCodexResponsesRequest(

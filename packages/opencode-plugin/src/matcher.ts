@@ -15,8 +15,7 @@ export function isChatgptCodexResponsesRequest(
     return false;
   }
   return (
-    parsed.protocol === "https:" &&
-    parsed.hostname === "chatgpt.com" &&
+    parsed.origin === CHATGPT_CODEX_ORIGIN &&
     parsed.pathname === CHATGPT_CODEX_PATHNAME &&
     parsed.search === ""
   );
