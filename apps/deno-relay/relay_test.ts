@@ -26,6 +26,45 @@ function createRequest(headers: HeadersInit = {}): Request {
   });
 }
 
+function trackActiveAbortListeners(signal: AbortSignal): () => number {
+  const activeListeners = new Set<EventListenerOrEventListenerObject>();
+  const originalAdd = EventTarget.prototype.addEventListener.bind(signal);
+  const originalRemove = EventTarget.prototype.removeEventListener.bind(
+    signal,
+  );
+
+  Object.defineProperties(signal, {
+    addEventListener: {
+      configurable: true,
+      value: (
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | AddEventListenerOptions,
+      ): void => {
+        if (type === "abort" && listener !== null) {
+          activeListeners.add(listener);
+        }
+        originalAdd(type, listener, options);
+      },
+    },
+    removeEventListener: {
+      configurable: true,
+      value: (
+        type: string,
+        listener: EventListenerOrEventListenerObject | null,
+        options?: boolean | EventListenerOptions,
+      ): void => {
+        if (type === "abort" && listener !== null) {
+          activeListeners.delete(listener);
+        }
+        originalRemove(type, listener, options);
+      },
+    },
+  });
+
+  return () => activeListeners.size;
+}
+
 Deno.test("forwards only authenticated requests and sanitizes hop headers", async () => {
   let upstreamRequest: Request | undefined;
   const handler = createRelayHandler({
@@ -371,6 +410,72 @@ Deno.test("does not impose an idle timer on non-SSE responses", async () => {
 
   assertEquals(await response.text(), "upstream-body", "response body");
   assertEquals(scheduleCalls, 1, "only the header timeout was scheduled");
+});
+
+Deno.test("detaches abort listeners after a non-SSE body completes", async () => {
+  const request = createRequest();
+  const activeAbortListeners = trackActiveAbortListeners(request.signal);
+  const handler = createRelayHandler({
+    getSecret: () => relayToken,
+    fetcher: () => Promise.resolve(new Response("upstream-body")),
+  });
+
+  const response = await handler(request);
+  assertEquals(await response.text(), "upstream-body", "response body");
+  assertEquals(
+    activeAbortListeners(),
+    0,
+    "active abort listeners after body completion",
+  );
+});
+
+Deno.test("detaches abort listeners when upstream fetch fails", async () => {
+  const request = createRequest();
+  const activeAbortListeners = trackActiveAbortListeners(request.signal);
+  const handler = createRelayHandler({
+    getSecret: () => relayToken,
+    fetcher: () => Promise.reject(new Error("upstream unavailable")),
+  });
+
+  let thrownError: unknown;
+  try {
+    await handler(request);
+  } catch (error) {
+    thrownError = error;
+  }
+
+  assert(thrownError instanceof Error, "upstream error was not propagated");
+  assertEquals(
+    activeAbortListeners(),
+    0,
+    "active abort listeners after upstream failure",
+  );
+});
+
+Deno.test("detaches abort listeners when the upstream header timeout expires", async () => {
+  const request = createRequest();
+  const activeAbortListeners = trackActiveAbortListeners(request.signal);
+  const handler = createRelayHandler({
+    getSecret: () => relayToken,
+    timeoutMs: 0,
+    fetcher: (_input, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new Error("upstream aborted")),
+          { once: true },
+        );
+      }),
+  });
+
+  const response = await handler(request);
+
+  assertEquals(response.status, 504, "timeout response status");
+  assertEquals(
+    activeAbortListeners(),
+    0,
+    "active abort listeners after header timeout",
+  );
 });
 
 Deno.test("cancels the upstream body when the downstream cancels", async () => {
