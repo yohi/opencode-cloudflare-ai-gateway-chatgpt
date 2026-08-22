@@ -20,3 +20,11 @@ export {
   CHATGPT_CODEX_PATHNAME,
   isChatgptCodexResponsesRequest,
 } from "./matcher.js";
+export {
+  applyControlHeaders,
+  METADATA_HEADER_VALUE,
+  rewriteCodexRequest,
+} from "./request-rewrite.js";
+export { installFetchInterposer } from "./interposer.js";
+export type { ConfigResolver, FetchLike } from "./interposer.js";
+export { CloudflareAiGatewayChatgpt } from "./plugin.js";
