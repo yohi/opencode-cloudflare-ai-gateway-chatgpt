@@ -3,6 +3,8 @@ export const UPSTREAM = "https://chatgpt.com/backend-api/codex/responses";
 const relayPath = "/v1/responses";
 const relayAuthorizationHeader = "x-chatgpt-relay-authorization";
 const upstreamHeaderTimeoutMs = 30_000;
+const sseIdleTimeoutMs = 120_000;
+const sseContentTypeMarker = "text/event-stream";
 const requestHeadersToRemove = new Set([
   "connection",
   "content-length",
@@ -43,6 +45,7 @@ export type RelayDependencies = {
   readonly getSecret: () => string | undefined;
   readonly timer?: RelayTimer;
   readonly timeoutMs?: number;
+  readonly idleTimeoutMs?: number;
 };
 
 function notFound(): Response {
@@ -105,10 +108,138 @@ function sanitizeResponseHeaders(source: Headers): Headers {
   return headers;
 }
 
+function createResponseBodyStream(
+  upstreamBody: ReadableStream<Uint8Array>,
+  options: {
+    readonly controller: AbortController;
+    readonly clientSignal: AbortSignal;
+    readonly timer: RelayTimer;
+    readonly idleTimeoutMs?: number;
+    readonly onFinished?: () => void;
+  },
+): ReadableStream<Uint8Array> {
+  const reader = upstreamBody.getReader();
+  let downstream: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let streamSettled = false;
+  let idleTimedOut = false;
+  let timerId: number | undefined;
+  let readerCancellation: Promise<void> | undefined;
+
+  const clearIdleTimer = (): void => {
+    if (timerId === undefined) {
+      return;
+    }
+    options.timer.clear(timerId);
+    timerId = undefined;
+  };
+
+  const finishStream = (): void => {
+    if (streamSettled) {
+      return;
+    }
+    streamSettled = true;
+    clearIdleTimer();
+    options.clientSignal.removeEventListener(
+      "abort",
+      cancelForClientDisconnect,
+    );
+    options.onFinished?.();
+  };
+
+  const cancelReader = (reason: unknown): Promise<void> => {
+    readerCancellation ??= reader.cancel(reason).then(
+      () => undefined,
+      () => undefined,
+    );
+    return readerCancellation;
+  };
+
+  const cancelForClientDisconnect = (): void => {
+    finishStream();
+    void cancelReader(options.clientSignal.reason);
+  };
+
+  const settleDownstream = (error: unknown): void => {
+    if (downstream === undefined) {
+      return;
+    }
+    finishStream();
+    try {
+      downstream.error(error);
+    } catch {
+      return;
+    }
+  };
+
+  const scheduleIdleTimer = (): number | undefined => {
+    if (options.idleTimeoutMs === undefined) {
+      return undefined;
+    }
+    return options.timer.schedule(() => {
+      idleTimedOut = true;
+      options.controller.abort();
+      settleDownstream(new Error("upstream_sse_idle_timeout"));
+    }, options.idleTimeoutMs);
+  };
+
+  timerId = scheduleIdleTimer();
+
+  const resetIdleTimer = (): void => {
+    if (options.idleTimeoutMs === undefined) {
+      return;
+    }
+    clearIdleTimer();
+    timerId = scheduleIdleTimer();
+  };
+
+  options.clientSignal.addEventListener("abort", cancelForClientDisconnect, {
+    once: true,
+  });
+  if (options.clientSignal.aborted) {
+    cancelForClientDisconnect();
+  }
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      downstream ??= controller;
+    },
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          finishStream();
+          controller.close();
+          return;
+        }
+        resetIdleTimer();
+        controller.enqueue(result.value);
+      } catch (error) {
+        if (idleTimedOut) {
+          settleDownstream(new Error("upstream_sse_idle_timeout"));
+          return;
+        }
+        settleDownstream(
+          options.idleTimeoutMs === undefined
+            ? error
+            : error instanceof Error
+            ? error
+            : new Error("upstream_stream_error"),
+        );
+      }
+    },
+    async cancel(reason) {
+      finishStream();
+      await cancelReader(reason);
+      options.controller.abort();
+    },
+  });
+}
+
 export function createRelayHandler(
   dependencies: RelayDependencies,
 ): (request: Request) => Promise<Response> {
   const timeoutMs = dependencies.timeoutMs ?? upstreamHeaderTimeoutMs;
+  const idleTimeoutMs = dependencies.idleTimeoutMs ?? sseIdleTimeoutMs;
   const timer: RelayTimer = dependencies.timer ?? {
     clear: clearTimeout,
     schedule: (callback, delayMs) => Number(setTimeout(callback, delayMs)),
@@ -132,6 +263,14 @@ export function createRelayHandler(
     const controller = new AbortController();
     let timedOut = false;
     const abortForClientDisconnect = (): void => controller.abort();
+    let clientAbortListenerDetached = false;
+    const detachClientAbortListener = (): void => {
+      if (clientAbortListenerDetached) {
+        return;
+      }
+      clientAbortListenerDetached = true;
+      request.signal.removeEventListener("abort", abortForClientDisconnect);
+    };
     request.signal.addEventListener("abort", abortForClientDisconnect, {
       once: true,
     });
@@ -149,11 +288,28 @@ export function createRelayHandler(
         signal: controller.signal,
       });
 
-      return new Response(upstream.body, {
+      const contentType = upstream.headers.get("content-type") ?? "";
+      if (upstream.body === null) {
+        detachClientAbortListener();
+      }
+      const body = upstream.body === null
+        ? null
+        : createResponseBodyStream(upstream.body, {
+          controller,
+          clientSignal: request.signal,
+          timer,
+          idleTimeoutMs: contentType.includes(sseContentTypeMarker)
+            ? idleTimeoutMs
+            : undefined,
+          onFinished: detachClientAbortListener,
+        });
+
+      return new Response(body, {
         status: upstream.status,
         headers: sanitizeResponseHeaders(upstream.headers),
       });
     } catch (error) {
+      detachClientAbortListener();
       if (timedOut) {
         return Response.json(
           { error: "upstream_connect_or_header_timeout" },
@@ -164,7 +320,6 @@ export function createRelayHandler(
       throw error;
     } finally {
       timer.clear(timeoutId);
-      request.signal.removeEventListener("abort", abortForClientDisconnect);
     }
   };
 }
