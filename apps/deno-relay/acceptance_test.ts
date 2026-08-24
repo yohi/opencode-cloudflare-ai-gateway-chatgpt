@@ -8,6 +8,7 @@ function readAcceptanceOrigin(): string | undefined {
 }
 
 const origin = readAcceptanceOrigin();
+const acceptanceTimeoutMs = 10_000;
 
 Deno.test({
   name: "acceptance: relay rejects wrong method with 404",
@@ -16,7 +17,10 @@ Deno.test({
     if (origin === undefined) {
       return;
     }
-    const response = await fetch(`${origin}/v1/responses`, { method: "GET" });
+    const response = await fetch(`${origin}/v1/responses`, {
+      method: "GET",
+      signal: AbortSignal.timeout(acceptanceTimeoutMs),
+    });
     try {
       if (response.status !== 404) {
         throw new Error(`expected 404, received ${response.status}`);
@@ -34,7 +38,10 @@ Deno.test({
     if (origin === undefined) {
       return;
     }
-    const response = await fetch(`${origin}/v1/responses`, { method: "POST" });
+    const response = await fetch(`${origin}/v1/responses`, {
+      method: "POST",
+      signal: AbortSignal.timeout(acceptanceTimeoutMs),
+    });
     try {
       if (response.status !== 401) {
         throw new Error(`expected 401, received ${response.status}`);
