@@ -146,9 +146,33 @@ npm run typecheck && npm test && npm run build # plugin 型検査・テスト・
 
 ## 自動リリース
 
-`master` への変更で release-please が `packages/opencode-plugin` の release PR を作成し、release PR のマージ後に GitHub Release 作成と GitHub Packages への公開を行います。公開には workflow 権限の `GITHUB_TOKEN` を使用します。
+`master` への push で release workflow が起動します。release-please は、
+`packages/opencode-plugin` に影響する releasable な Conventional Commit
+（`feat`、`fix`、`deps`、破壊的変更など）がある場合にのみ、plugin の
+release PR を作成または更新します。`apps/deno-relay` のみの変更や、既定で
+リリース対象外のコミット（`chore`、`build` など）では plugin release PR は
+作成されません。release PR のマージ後に GitHub Release 作成と GitHub
+Packages への公開を行い、公開には workflow 権限の `GITHUB_TOKEN` を使用します。
 
-`apps/deno-relay` のみの変更では plugin release は作成されません。plugin の初回 `0.1.0` 公開は、下記チェックリストの手順に従います。利用側は `.npmrc` で `@yohi` scope を `https://npm.pkg.github.com` に向け、`read:packages` 権限のGitHub tokenで認証します。
+plugin の初回 `0.1.0` 公開は、下記チェックリストの手順に従います。GitHub
+Packages の npm registry を利用する場合は、次の手順で利用者用の GitHub
+PAT (classic) を準備してください。
+
+1. GitHub の **Settings > Developer settings > Personal access tokens >
+   Tokens (classic)** から PAT (classic) を作成し、パッケージのインストールには
+   `read:packages` 権限を付与します。
+2. 実トークンをリポジトリへ保存せず、環境変数
+   `GITHUB_PACKAGES_TOKEN` に設定します。
+3. 利用者の `~/.npmrc` またはローカルの `.npmrc` に、トークン値を
+   含めない次の設定を追加します。
+
+   ```ini
+   @yohi:registry=https://npm.pkg.github.com
+   //npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
+   ```
+
+この手順は利用者向けの認証設定です。`.npmrc` やその他のファイルに PAT の実値を
+保存したり、リポジトリへコミットしたりしないでください。
 
 ## リリースチェックリスト（GitHub Packages）
 
@@ -156,7 +180,9 @@ npm run typecheck && npm test && npm run build # plugin 型検査・テスト・
 2. [ ] `SUPPORTED_OPENCODE_RANGE` と `peerDependencies.opencode` を実際の能力提供バージョンに更新し、`test/package-consistency.test.ts` を通すこと。
 3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth 認証情報）を `protected-acceptance` 環境で実行し、200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモード、Gateway log 作成、パスマッピングを確認すること。
 4. [ ] README のサポート範囲表記を更新すること。
-5. [ ] 初回はGitHub Packages registryへの認証を設定し、`packages/opencode-plugin` で `npm publish --ignore-scripts` を実行すること。
+5. [ ] 初回の手動公開前に、`write:packages` 権限を持つ GitHub PAT
+   (classic) で GitHub Packages registry に認証すること。その後、
+   `packages/opencode-plugin` で `npm publish --ignore-scripts` を実行すること。
 
 ## スコープ外
 
