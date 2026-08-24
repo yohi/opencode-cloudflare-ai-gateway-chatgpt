@@ -94,8 +94,12 @@ describe("BYOK compatibility contract", () => {
     const sent = spy.requests[0];
     expect(sent.url).toBe(gatewayUrl);
     expect(sent.headers.get("Authorization")).toBe("Bearer oauth-access-token");
+    expect(sent.headers.get("ChatGPT-Account-Id")).toBe("account-42");
     expect(sent.headers.get("cf-aig-authorization")).toBe(
       "Bearer sentinel-gw-token",
+    );
+    expect(sent.headers.get("x-chatgpt-relay-authorization")).toBe(
+      "Bearer sentinel-relay-token",
     );
   });
 
