@@ -38,6 +38,6 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: packages/opencode-plugin/package-lock.json
-      - run: npm ci --legacy-peer-deps
+      - run: npm ci --legacy-peer-deps --ignore-scripts
       - run: npm run typecheck
       - run: npm test
