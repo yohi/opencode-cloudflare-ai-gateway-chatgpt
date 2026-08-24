@@ -1,0 +1,28 @@
+name: Protected acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: protected-acceptance
+    env:
+      RELAY_ACCEPTANCE_ORIGIN: ${{ vars.RELAY_ACCEPTANCE_ORIGIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
+      - name: Skip when no acceptance origin is configured
+        if: ${{ vars.RELAY_ACCEPTANCE_ORIGIN == '' }}
+        run: |
+          echo "RELAY_ACCEPTANCE_ORIGIN is not configured; skipping."
+          exit 0
+      - name: Run acceptance tests
+        if: ${{ vars.RELAY_ACCEPTANCE_ORIGIN != '' }}
+        run: deno test --allow-net --allow-env apps/deno-relay/acceptance_test.ts
