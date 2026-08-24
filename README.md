@@ -9,6 +9,8 @@ OpenCode の ChatGPT Codex 通信を Cloudflare AI Gateway 経由で観測可能
 
 二者は実行時ライブラリを共有しません。唯一の結合は文書化された HTTP contract（Gateway Custom Provider リクエストが `X-ChatGPT-Relay-Authorization` ヘッダー付きで relay の `POST /v1/responses` に到達すること）です。実行時依存は、plugin 側が `semver` のみ、relay 側がゼロです。
 
+Deno Deploy の application directory はリポジトリルートです。entrypoint はルート `deno.json` の `deploy.runtime.entrypoint` で `./apps/deno-relay/main.ts` に固定し、Deno Deploy dashboard の自動推測に依存しません。
+
 ## 経路
 
 ```text

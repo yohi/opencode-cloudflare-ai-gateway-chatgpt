@@ -1,7 +1,16 @@
 import { createRelayHandler } from "./relay.ts";
+import rootDenoConfig from "../../deno.json" with { type: "json" };
 
 const relayToken = "relay-test-token";
 const relayAuthorization = `Bearer ${relayToken}`;
+
+type RootDenoConfig = {
+  readonly deploy?: {
+    readonly runtime?: {
+      readonly entrypoint?: string;
+    };
+  };
+};
 
 function assertEquals<T>(actual: T, expected: T, message: string): void {
   if (actual !== expected) {
@@ -25,6 +34,15 @@ function createRequest(headers: HeadersInit = {}): Request {
     body: "request-body",
   });
 }
+
+Deno.test("configures Deno Deploy to start the relay entrypoint", () => {
+  const config = rootDenoConfig as RootDenoConfig;
+  assertEquals(
+    config.deploy?.runtime?.entrypoint,
+    "./apps/deno-relay/main.ts",
+    "Deno Deploy entrypoint",
+  );
+});
 
 function trackActiveAbortListeners(signal: AbortSignal): () => number {
   const activeListeners = new Set<EventListenerOrEventListenerObject>();
