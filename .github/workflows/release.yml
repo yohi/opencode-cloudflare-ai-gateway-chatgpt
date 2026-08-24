@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: 22
           registry-url: https://npm.pkg.github.com
-          scope: '@${{ github.repository_owner }}'
+          scope: "@${{ github.repository_owner }}"
 
       - name: Install plugin dependencies
         if: ${{ steps.release.outputs.releases_created == 'true' }}
