@@ -5,5 +5,11 @@
   },
   "lint": {
     "exclude": ["packages", "docs", ".omo", ".justice"]
+  },
+  "deploy": {
+    "runtime": {
+      "type": "dynamic",
+      "entrypoint": "./apps/deno-relay/main.ts"
+    }
   }
 }

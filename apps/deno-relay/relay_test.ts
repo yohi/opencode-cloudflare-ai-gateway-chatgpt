@@ -1,7 +1,16 @@
 import { createRelayHandler } from "./relay.ts";
+import rootDenoConfig from "../../deno.json" with { type: "json" };
 
 const relayToken = "relay-test-token";
 const relayAuthorization = `Bearer ${relayToken}`;
+
+type RootDenoConfig = {
+  readonly deploy?: {
+    readonly runtime?: {
+      readonly entrypoint?: string;
+    };
+  };
+};
 
 function assertEquals<T>(actual: T, expected: T, message: string): void {
   if (actual !== expected) {
@@ -25,6 +34,15 @@ function createRequest(headers: HeadersInit = {}): Request {
     body: "request-body",
   });
 }
+
+Deno.test("configures Deno Deploy to start the relay entrypoint", () => {
+  const config = rootDenoConfig as RootDenoConfig;
+  assertEquals(
+    config.deploy?.runtime?.entrypoint,
+    "./apps/deno-relay/main.ts",
+    "Deno Deploy entrypoint",
+  );
+});
 
 function trackActiveAbortListeners(signal: AbortSignal): () => number {
   const activeListeners = new Set<EventListenerOrEventListenerObject>();
@@ -192,6 +210,23 @@ Deno.test("rejects missing or invalid relay credentials before fetching upstream
     401,
     "invalid credential status",
   );
+  assertEquals(fetchCalls, 0, "upstream fetch calls");
+});
+
+Deno.test("rejects requests when the relay secret is unavailable", async () => {
+  let fetchCalls = 0;
+  const handler = createRelayHandler({
+    getSecret: () => undefined,
+    fetcher: () => {
+      fetchCalls += 1;
+      return Promise.resolve(new Response());
+    },
+  });
+
+  const response = await handler(createRequest());
+
+  assertEquals(response.status, 503, "unavailable relay secret status");
+  assertEquals(await response.text(), "Service unavailable", "response body");
   assertEquals(fetchCalls, 0, "upstream fetch calls");
 });
 
