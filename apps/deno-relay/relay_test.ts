@@ -195,6 +195,23 @@ Deno.test("rejects missing or invalid relay credentials before fetching upstream
   assertEquals(fetchCalls, 0, "upstream fetch calls");
 });
 
+Deno.test("rejects requests when the relay secret is unavailable", async () => {
+  let fetchCalls = 0;
+  const handler = createRelayHandler({
+    getSecret: () => undefined,
+    fetcher: () => {
+      fetchCalls += 1;
+      return Promise.resolve(new Response());
+    },
+  });
+
+  const response = await handler(createRequest());
+
+  assertEquals(response.status, 503, "unavailable relay secret status");
+  assertEquals(await response.text(), "Service unavailable", "response body");
+  assertEquals(fetchCalls, 0, "upstream fetch calls");
+});
+
 Deno.test("rejects every route and method other than POST /v1/responses", async () => {
   let fetchCalls = 0;
   const handler = createRelayHandler({
