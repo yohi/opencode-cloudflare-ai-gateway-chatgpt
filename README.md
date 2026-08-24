@@ -133,13 +133,6 @@ upstream の `401`、`403`、`429`、`5xx` 結果はそのまま pass-through �
 - Gateway token と relay token は異なる credential です。プラグインの ChatGPT Custom Provider 経路では、Gateway token は Cloudflare で停止し、relay token は relay で停止します。relay は転送前に `cf-aig-*` と `cf-*` ヘッダーを除去します。
 - Gateway 失敗、relay 失敗、DNS/connection 失敗、タイムアウト、およびすべての ChatGPT upstream エラーは OpenCode に返却されます。direct fallback は試みられません。
 
-## BYOK 互換性
-
-`@yohi/cloudflare-ai-gateway-byok` の互換リリース以降と組み合わせて使用してください。
-BYOK は自ら生成したリクエスト以外の `Authorization` を削除しないことが契約です（ChatGPT Custom Provider Gateway URL から OAuth `Authorization` を削除してはなりません）。
-
-互換性はリリースゲートです: 最低互換 BYOK バージョンを文書化し、両ロード順のコントラクトテストを通常 CI で実施します。プラグインは実行時に BYOK を確実に識別できず、後から fetch wrapper がリクエストを変更しても検出できないため、旧バージョン検出による best-effort 警告は意図的に実装していません。
-
 ## 開発
 
 ```bash
