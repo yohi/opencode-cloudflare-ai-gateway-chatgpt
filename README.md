@@ -74,7 +74,7 @@ deno lint                                # lint
 deno fmt --check                         # フォーマット検査
 cd packages/opencode-plugin
 npm ci --legacy-peer-deps                 # plugin 依存
-npm run typecheck && npm test             # plugin 型検査・テスト
+npm run typecheck && npm test && npm run build # plugin 型検査・テスト・ビルド
 ```
 
 ## リリースチェックリスト（npm 公開）
