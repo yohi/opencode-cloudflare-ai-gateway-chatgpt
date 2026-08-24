@@ -144,13 +144,19 @@ npm ci --legacy-peer-deps                 # plugin 依存
 npm run typecheck && npm test && npm run build # plugin 型検査・テスト・ビルド
 ```
 
-## リリースチェックリスト（npm 公開）
+## 自動リリース
+
+`master` への変更で release-please が `packages/opencode-plugin` の release PR を作成し、release PR のマージ後に GitHub Release 作成と GitHub Packages への公開を行います。公開には workflow 権限の `GITHUB_TOKEN` を使用します。
+
+`apps/deno-relay` のみの変更では plugin release は作成されません。plugin の初回 `0.1.0` 公開は、下記チェックリストの手順に従います。利用側は `.npmrc` で `@yohi` scope を `https://npm.pkg.github.com` に向け、`read:packages` 権限のGitHub tokenで認証します。
+
+## リリースチェックリスト（GitHub Packages）
 
 1. [ ] OpenCode が `PluginInput` でホストバージョン能力を公開したリリースが出ていること。さらに activate 拒否時にホスト側が一致する Codex リクエストを block できること（拒否だけでは direct request を防げない）。
 2. [ ] `SUPPORTED_OPENCODE_RANGE` と `peerDependencies.opencode` を実際の能力提供バージョンに更新し、`test/package-consistency.test.ts` を通すこと。
 3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth 認証情報）を `protected-acceptance` 環境で実行し、200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモード、Gateway log 作成、パスマッピングを確認すること。
 4. [ ] README のサポート範囲表記を更新すること。
-5. [ ] 初回は `npm publish --access public` を実行すること。
+5. [ ] 初回はGitHub Packages registryへの認証を設定し、`packages/opencode-plugin` で `npm publish --ignore-scripts` を実行すること。
 
 ## スコープ外
 

@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Create release PR or GitHub release
+        id: release
+        uses: googleapis/release-please-action@c3fc4de07084f75a2b61a5b933069bda6edf3d5c # v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          target-branch: master
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          include-component-in-tag: false
+
+      - name: Check out the released package
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.release.outputs['packages/opencode-plugin--tag_name'] }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+          scope: '@${{ github.repository_owner }}'
+
+      - name: Install plugin dependencies
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        working-directory: packages/opencode-plugin
+        run: npm ci --legacy-peer-deps --ignore-scripts
+
+      - name: Verify plugin package
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        working-directory: packages/opencode-plugin
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Publish plugin package to GitHub Packages
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        working-directory: packages/opencode-plugin
+        run: npm publish --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pack npm package release asset
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        working-directory: packages/opencode-plugin
+        run: npm pack --ignore-scripts
+
+      - name: Upload npm package release asset
+        if: ${{ steps.release.outputs.releases_created == 'true' }}
+        working-directory: packages/opencode-plugin
+        run: gh release upload "${{ steps.release.outputs['packages/opencode-plugin--tag_name'] }}" ./*.tgz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
