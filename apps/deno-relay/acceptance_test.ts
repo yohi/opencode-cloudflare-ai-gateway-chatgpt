@@ -17,8 +17,12 @@ Deno.test({
       return;
     }
     const response = await fetch(`${origin}/v1/responses`, { method: "GET" });
-    if (response.status !== 404) {
-      throw new Error(`expected 404, received ${response.status}`);
+    try {
+      if (response.status !== 404) {
+        throw new Error(`expected 404, received ${response.status}`);
+      }
+    } finally {
+      await response.body?.cancel();
     }
   },
 });
@@ -31,8 +35,12 @@ Deno.test({
       return;
     }
     const response = await fetch(`${origin}/v1/responses`, { method: "POST" });
-    if (response.status !== 401) {
-      throw new Error(`expected 401, received ${response.status}`);
+    try {
+      if (response.status !== 401) {
+        throw new Error(`expected 401, received ${response.status}`);
+      }
+    } finally {
+      await response.body?.cancel();
     }
   },
 });
