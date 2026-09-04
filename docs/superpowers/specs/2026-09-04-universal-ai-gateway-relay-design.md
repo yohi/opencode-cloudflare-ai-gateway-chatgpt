@@ -19,7 +19,7 @@ Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブと�
 
 - **ゼロ外部依存**: Deno 標準 API のみで実装する
 - **ステートレス**: リレー自身は永続状態を持たない
-- **最小限の介入**: `tools` 配列のみを正規化し、`messages` 等の大容量フィールドは一切改変しない
+- **最小限の介入**: raw/token-preserving な body のうち `tools[].function.parameters` の対象キーのみを正規化し、`messages` 等の大容量フィールドと正規化対象外の JSON token は一切改変しない
 - **後方互換**: 既存 `POST /v1/responses` 経路を維持する
 - **責務分離**: HTTP 転送、ルーティング、スキーマ変換、各経路ハンドラを分離する
 
@@ -87,7 +87,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の body パース・スキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にし、upstream の 3xx を追従せず透過する |
 | `schema.ts` | `tools[].function.parameters` の正規化実装 |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
@@ -108,7 +108,7 @@ apps/deno-relay/
                              ├─ slug 解決（command-code）
                              ├─ 未知 slug → 404
                              ├─ HTTP method をそのまま forward
-                             ├─ POST + application/json の場合のみ body JSON パース
+                             ├─ POST + application/json の場合のみ lossless token scan/transform
                              ├─ JSON parse 失敗 → 400 `{"error":"invalid_json_body"}`（upstream fetch 前）
                              ├─ schema.ts で tools 正規化
                              ├─ upstream URL = base + 残りパス・クエリ
@@ -150,10 +150,17 @@ apps/deno-relay/
 - `Content-Type` を HTTP media type として解釈した type/subtype が `application/json` であること（パラメータ付き表記を許容し、type/subtype は大文字小文字非依存で比較する）
 - ボディが JSON としてパース可能であること
 - `body.tools` が配列であること
+- 全体の `JSON.parse` → `JSON.stringify` ではなく、raw/token-preserving な変換を適用できること
 
 ### 5.2 正規化ルール
 
 各 `tools[].function.parameters` に対し、以下を適用する。
+
+- **JSON body の表現と数値保持**
+  - リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify` で再構築してはならない。各 JSON token の元の body byte span を保持する raw/token-preserving な表現で、対象となる `tools[].function.parameters` の変更対象 span だけを置換する。
+  - `tools` 以外のフィールド、正規化対象外のフィールド、およびそれらの JSON token（number を含む）は元の body bytes のまま保持する。
+  - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現としてコピーする。`9007199254740993` と `9223372036854775807` を丸めずに保持できることを必須とする。
+  - 無損失な変換結果を保証できない場合は、部分的に再シリアライズした body を upstream に送らず、元の body bytes をそのまま転送して正規化をスキップする。
 
 1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
    - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
@@ -288,6 +295,9 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 - 引数なしツールの正規化
 - 既存の正しいスキーマは無改変
 - `messages` や他フィールドが残ること
+- top-level/provider field と `messages` 内の `9007199254740993`、および tool schema 内の `9223372036854775807` が丸められず、入力と同じ JSON number token で保持されること
+- `-0`、指数表記、末尾ゼロを含む正規化対象外の number token が変換前後で変更されないこと
+- 無損失な変換結果を保証できないケースでは、部分再シリアライズを行わず、元の body bytes がそのまま upstream に渡されて正規化がスキップされること
 - `anyOf` 要素がオブジェクトでない場合は無改変
 - 空 `tools` 配列の場合の無改変
 
@@ -306,7 +316,7 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
   - URL === `https://api.commandcode.ai/provider/v1/models`
   - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
   - `X-Relay-Authorization` は upstream に届かない
-- POST `/upstream/command-code/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら body を JSON パースし tools 正規化が行われること
+- POST `/upstream/command-code/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で tools 正規化が行われること
 - POST `/upstream/command-code/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、body `{"error":"invalid_json_body"}`、upstream fetch call count `0` となること
 - `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は同じ `400` / `{"error":"invalid_json_body"}` となり、upstream fetch call count が `0` であること
 - POST + `application/json` の空 body（body なしを含む）は `400` / `{"error":"invalid_json_body"}` とし、upstream fetch call count が `0` であること
@@ -324,6 +334,8 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 - relay secret 不正/欠落時は upstream fetch 前に `401`
 - `RELAY_SECRET` が `Authorization` として upstream へ漏れない
 - リクエストボディの tools 正規化が upstream で確認できること
+- unsafe integer を含む JSON body で tools の正規化を行っても、upstream で unsafe integer の number token が入力どおり保持されること
+- 無損失な変換を保証できない JSON body は、部分的な再シリアライズなしに元の body bytes のまま upstream へ転送されること
 - 既存 `/v1/responses` テスト（SSE、header timeout、SSE idle timeout、client abort、header sanitization を含む）の維持
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
 - `/v1/responses` が `Authorization` / `X-Relay-Authorization` を受け付けないこと（推奨、省略可）

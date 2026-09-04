@@ -78,6 +78,11 @@
     - `/upstream/*` の POST かつ media type が `application/json` の場合、body の JSON パースに失敗したら、upstream fetch の前に status `400`、body `{"error":"invalid_json_body"}` を返す。
     - 空の body（body なしを含む）も JSON パース失敗として同じ扱いとする。
     - 既存の `/v1/responses` 経路では body をパースせず、従来のストリーミング転送を維持する。
+  - **JSON 数値の無損失保持**:
+    - 汎用経路は、リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify` で再構築してはならない。これにより、正規化対象外のフィールドや数値リテラルが暗黙に変更されることを防ぐ。
+    - 正規化は各 JSON token の元の body byte span を保持する raw/token-preserving 表現を使い、対象となる `tools[].function.parameters` の変更対象 span だけを置換する。それ以外の body bytes と JSON token（number を含む）は保持する。
+    - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現として扱う。少なくとも `9007199254740993` と `9223372036854775807` は入力と同じ値・表記で転送する。
+    - 無損失な変換結果を保証できない場合は、正規化済み部分と元の部分を混在させた body を生成せず、元の body bytes をそのまま upstream へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの silent data corruption は許容しない。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
     - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
@@ -92,7 +97,8 @@
   - **空 properties の健全化**:
     - 引数のないツールのパラメータ定義であっても、`"properties": {}` を保持させて厳格バリデータを通過させる。
 - **メッセージ / 引数の破損防止**:
-  - `tools` 以外の巨大なフィールド（`messages` 等）は一切改変せず、参照を維持したまま転送する。
+  - `tools` 以外の巨大なフィールド（`messages` 等）は一切改変せず、raw/token-preserving な body のまま転送する。
+  - `tools[].function.parameters` でも正規化対象外のフィールドと JSON 数値 token は一切改変しない。
 
 ### 3.3 認証・セキュリティ機能
 - **リレー共通認証トークン**:
