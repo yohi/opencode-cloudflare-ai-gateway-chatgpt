@@ -66,6 +66,11 @@
   - **プリセットプロバイダ定義**:
     - `command-code`: `https://api.commandcode.ai/provider/v1/`
     - 今後追加される任意の OpenAI 互換プロバイダ
+- **upstream URL の containment**:
+  - プリセットの base URL は固定された絶対 URL として解釈する。クライアント由来の path suffix は URL reference として解決せず、プリセットの pathname に付加する path data として扱う。`new URL(suffix, base)` の relative/root/authority reference semantics に依存してはならない。
+  - 最終 upstream URL の `origin` はプリセット base URL の `origin` と完全一致し、`pathname` はプリセット base URL の固定 pathname prefix 配下でなければならない。prefix の末尾 `/` は path segment boundary として扱い、`command-code` では `/provider/v1/` 配下だけを許可する。
+  - URL の構築・解析・正規化後に containment を証明できない suffix、`//` または `///` で始まる authority-like suffix、dot segment、percent-encoded dot segment、または path segmentation を変え得る encoded separator は、上流 fetch 前に `404 Not Found` とする。
+  - query string は incoming URL の `search` として pathname から分離して保持し、path の URL 解決には使用しない。正常な query string は upstream へ透過する。
 - **後方互換性の維持**:
   - 既存の ChatGPT Codex 経路（`/v1/responses`）はそのまま維持し、`https://chatgpt.com/backend-api/codex/responses` へ転送する。
 - **未知のプロバイダへの対応**:
@@ -81,6 +86,8 @@
   - **JSON 数値の無損失保持**:
     - 汎用経路は、リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify` で再構築してはならない。これにより、正規化対象外のフィールドや数値リテラルが暗黙に変更されることを防ぐ。
     - 正規化は各 JSON token の元の body byte span を保持する raw/token-preserving 表現を使い、対象となる `tools[].function.parameters` の変更対象 span だけを置換する。それ以外の body bytes と JSON token（number を含む）は保持する。
+    - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
+    - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
     - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現として扱う。少なくとも `9007199254740993` と `9223372036854775807` は入力と同じ値・表記で転送する。
     - 無損失な変換結果を保証できない場合は、正規化済み部分と元の部分を混在させた body を生成せず、元の body bytes をそのまま upstream へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの silent data corruption は許容しない。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:

@@ -87,7 +87,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にし、upstream の 3xx を追従せず透過する |
 | `schema.ts` | `tools[].function.parameters` の正規化実装 |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
@@ -107,11 +107,15 @@ apps/deno-relay/
    └─ /upstream/<slug>/* ──▶ [upstream.ts]
                              ├─ slug 解決（command-code）
                              ├─ 未知 slug → 404
+                             ├─ pathname suffix と query を分離
+                             ├─ suffix を path data として preset pathname に付加
+                             ├─ origin と pathname prefix の containment 検証
+                             ├─ containment 違反/検証不能 → 404（fetch 0 回）
                              ├─ HTTP method をそのまま forward
                              ├─ POST + application/json の場合のみ lossless token scan/transform
                              ├─ JSON parse 失敗 → 400 `{"error":"invalid_json_body"}`（upstream fetch 前）
                              ├─ schema.ts で tools 正規化
-                             ├─ upstream URL = base + 残りパス・クエリ
+                             ├─ containment 検証済みの upstream URL と query を forward
                              └─ forward.ts で `redirect: "manual"` を指定して転送
 ```
 
@@ -136,6 +140,7 @@ apps/deno-relay/
   - リレー認証ヘッダー除去（`X-Relay-Authorization`、`X-ChatGPT-Relay-Authorization`）
   - `Connection` ヘッダーに列挙されたヘッダー除去
   - 標準 `Authorization` ヘッダーは upstream provider credential として保持・転送する
+- upstream URL の containment 検証が完了するまで provider credential を転送しない
 - upstream 応答ヘッダーのサニタイズ
 - upstream fetch では必ず `redirect: "manual"` を指定する（`/v1/responses` と `/upstream/*` 共通）。
 - upstream の 302、307 等は追加 fetch せず、status、サニタイズ後の response headers（`Location` を含む）、body をそのまま relay response へ透過する。
@@ -161,6 +166,8 @@ apps/deno-relay/
   - `tools` 以外のフィールド、正規化対象外のフィールド、およびそれらの JSON token（number を含む）は元の body bytes のまま保持する。
   - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現としてコピーする。`9007199254740993` と `9223372036854775807` を丸めずに保持できることを必須とする。
   - 無損失な変換結果を保証できない場合は、部分的に再シリアライズした body を upstream に送らず、元の body bytes をそのまま転送して正規化をスキップする。
+  - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
+  - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
 1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
    - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
@@ -240,6 +247,7 @@ apps/deno-relay/
 | `RELAY_SECRET` 未設定/空 | `503` | `Service unavailable` | upstream fetch 前 |
 | 認証ヘッダー欠落/不一致 | `401` | `{"error":"unauthorized"}` | upstream fetch 前 |
 | 未知の provider slug | `404` | `Not Found` | upstream fetch 前 |
+| upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
 | リクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | `{"error":"invalid_json_body"}` | 汎用経路のみ。upstream fetch 前に返す |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
@@ -261,7 +269,9 @@ apps/deno-relay/
 |---|---|---|
 | `command-code` | `https://api.commandcode.ai/provider/v1/` | `/chat/completions`, `/messages`, `/models` |
 
-upstream URL は `base URL + path suffix` で構築する。`command-code` の base URL は `/provider/v1/` で終わるため、relay route の `/upstream/command-code/` 以降には `/v1` を含めず、例えば `/chat/completions` を付加して `https://api.commandcode.ai/provider/v1/chat/completions` とする。
+upstream URL は、path suffix を URL reference として解決せず、preset base URL の pathname に path data として付加して構築する。`command-code` の base URL は `/provider/v1/` で終わるため、relay route の `/upstream/command-code/` 以降には `/v1` を含めず、例えば `/chat/completions` を付加して `https://api.commandcode.ai/provider/v1/chat/completions` とする。
+
+構築後の upstream URL は、preset base URL と同じ `origin` であり、preset の固定 pathname prefix（`command-code` では `/provider/v1/`）配下であることを検証する。prefix の末尾 `/` は path segment boundary として扱う。`//` または `///` で始まる authority-like suffix、dot segment、percent-encoded dot segment、path segmentation を変え得る encoded separator、その他 containment を証明できない suffix は `404 Not Found` とし、provider の `Authorization` を付けた upstream fetch を実行しない。query string は incoming URL の `search` として分離して保持し、正常な値は変更せず upstream へ透過する。
 
 未知の `provider-slug` へのリクエストは `404 Not Found` を返す。
 
@@ -295,9 +305,16 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 - 引数なしツールの正規化
 - 既存の正しいスキーマは無改変
 - `messages` や他フィールドが残ること
+- string 値内の `{`、`}`、`[`、`]`、`,`、`:` が構造 delimiter として誤認されないこと
+- escaped quote、backslash、`\u0000` 形式の escape を含む string が正しく scan されること
+- `messages` 内の文字列としての `"tools"` や JSON source が member path として誤認されないこと
+- `\uXXXX` escape を含む JSON string と key を正しく処理し、semantic member path と raw key bytes の契約を満たすこと
+- 日本語・emoji が対象 span より前にある body で、UTF-8 byte offset と UTF-16 code-unit index を混同しないこと
+- 同一 body に複数の tools があり、1つ目の patch で body 長が増えても後続 patch が正しい span に適用されること
+- minified JSON と whitespace-heavy JSON の両方で、変更対象外の raw bytes が完全一致すること
 - top-level/provider field と `messages` 内の `9007199254740993`、および tool schema 内の `9223372036854775807` が丸められず、入力と同じ JSON number token で保持されること
 - `-0`、指数表記、末尾ゼロを含む正規化対象外の number token が変換前後で変更されないこと
-- 無損失な変換結果を保証できないケースでは、部分再シリアライズを行わず、元の body bytes がそのまま upstream に渡されて正規化がスキップされること
+- scanner が valid JSON の token boundary を安全に確定できないと判定したケースでは、部分再シリアライズを行わず、元の body bytes がそのまま upstream に渡されて正規化がスキップされること。判定条件またはテスト用の failure injection を固定し、400 の JSON parse failure と混同しないこと
 - `anyOf` 要素がオブジェクトでない場合は無改変
 - 空 `tools` 配列の場合の無改変
 
@@ -307,6 +324,9 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 
 - `/upstream/command-code/chat/completions` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/chat/completions` 完全一致）
 - `/upstream/command-code/messages` への転送と upstream URL 検証
+- `/upstream/command-code//attacker.example/collect` と `/upstream/command-code///attacker.example/collect` が `404` となり、attacker への fetch が発生しないこと
+- `/upstream/command-code/../other`、`/upstream/command-code/./other`、および到達可能な percent-encoded dot segment/encoded separator が containment 違反として扱われ、異常ケースごとに upstream fetch call count が `0` であること
+- containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - upstream mock が 302 または 307（`Location` と body 付き）を返した場合に、redirect 先を追加 fetch せず、status・`Location` を含む許可済み response headers・body を透過すること（upstream fetch call count は 1）
@@ -334,8 +354,11 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 - relay secret 不正/欠落時は upstream fetch 前に `401`
 - `RELAY_SECRET` が `Authorization` として upstream へ漏れない
 - リクエストボディの tools 正規化が upstream で確認できること
+- string 内 delimiter/escape、`messages` 内の `"tools"`、`\u0000` escape、日本語・emoji、および minified/whitespace-heavy 表現を含む body で scanner が正しい member path と byte span を認識すること
+- 複数 tools の body で、先行 patch による body 長の増加後も後続 patch が正しい tool schema に適用されること
+- body を UTF-8 bytes として比較し、正規化対象 span 以外の bytes が入力と完全一致すること（JS object の deep equality だけで判定しない）
 - unsafe integer を含む JSON body で tools の正規化を行っても、upstream で unsafe integer の number token が入力どおり保持されること
-- 無損失な変換を保証できない JSON body は、部分的な再シリアライズなしに元の body bytes のまま upstream へ転送されること
+- valid JSON でも scanner が token span を安全に確定できないと判定した body は、`400` にせず、部分的な再シリアライズなしに元の body bytes のまま upstream へ転送されること
 - 既存 `/v1/responses` テスト（SSE、header timeout、SSE idle timeout、client abort、header sanitization を含む）の維持
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
 - `/v1/responses` が `Authorization` / `X-Relay-Authorization` を受け付けないこと（推奨、省略可）
