@@ -2,6 +2,7 @@ import {
   assertJsonResponse,
   assertSuccessfulResponse,
   isGatewayAcceptanceConfigured,
+  normalizeAcceptanceOrigin,
   requestThroughGateway,
 } from "./acceptance_support.ts";
 
@@ -23,24 +24,31 @@ async function captureError(action: () => Promise<void>): Promise<Error> {
   throw new Error("expected the action to throw");
 }
 
-Deno.test("detects complete protected acceptance configuration", () => {
+Deno.test("detects complete Gateway acceptance configuration without relay secret", () => {
   const values = new Map([
     ["RELAY_ACCEPTANCE_GATEWAY_BASE_URL", "https://gateway.ai.cloudflare.com"],
     ["RELAY_ACCEPTANCE_MODEL", "acceptance-model"],
     ["RELAY_ACCEPTANCE_GATEWAY_TOKEN", "gateway-token"],
     ["RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY", "command-code-key"],
-    ["RELAY_ACCEPTANCE_RELAY_SECRET", "relay-secret"],
   ]);
 
   assert(
     isGatewayAcceptanceConfigured((name) => values.get(name)),
-    "did not detect complete protected acceptance configuration",
+    "did not detect complete Gateway acceptance configuration without relay secret",
   );
 
   values.set("RELAY_ACCEPTANCE_GATEWAY_TOKEN", " ");
   assert(
     !isGatewayAcceptanceConfigured((name) => values.get(name)),
     "accepted an empty protected acceptance configuration value",
+  );
+});
+
+Deno.test("normalizes relay acceptance origin before appending the relay path", () => {
+  assert(
+    normalizeAcceptanceOrigin("  https://relay.example///  ") ===
+      "https://relay.example",
+    "did not trim and remove trailing slashes from the relay origin",
   );
 });
 
@@ -141,7 +149,6 @@ Deno.test(
               model: "acceptance-model",
               gatewayToken: "gateway-token",
               commandCodeApiKey: "command-code-key",
-              relaySecret: "relay-secret",
             },
             "/v1/models",
             { method: "GET" },

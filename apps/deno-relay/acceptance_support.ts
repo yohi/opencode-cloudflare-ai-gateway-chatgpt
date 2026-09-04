@@ -3,7 +3,6 @@ export type GatewayAcceptanceConfig = {
   readonly model: string;
   readonly gatewayToken: string;
   readonly commandCodeApiKey: string;
-  readonly relaySecret: string;
 };
 
 export type ExpectedJsonResponse = {
@@ -19,7 +18,6 @@ const gatewayAcceptanceEnvironmentNames = [
   "RELAY_ACCEPTANCE_MODEL",
   "RELAY_ACCEPTANCE_GATEWAY_TOKEN",
   "RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY",
-  "RELAY_ACCEPTANCE_RELAY_SECRET",
 ] as const;
 
 const safeRootAnyOf = {
@@ -59,6 +57,16 @@ function requiredEnvironmentValue(name: string): string {
   return value;
 }
 
+export function normalizeAcceptanceOrigin(
+  value: string | undefined,
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const origin = value.trim().replace(/\/+$/, "");
+  return origin.length === 0 ? undefined : origin;
+}
+
 export function readGatewayAcceptanceConfig(): GatewayAcceptanceConfig {
   return {
     gatewayBaseUrl: requiredEnvironmentValue(
@@ -69,7 +77,6 @@ export function readGatewayAcceptanceConfig(): GatewayAcceptanceConfig {
     commandCodeApiKey: requiredEnvironmentValue(
       "RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY",
     ),
-    relaySecret: requiredEnvironmentValue("RELAY_ACCEPTANCE_RELAY_SECRET"),
   };
 }
 

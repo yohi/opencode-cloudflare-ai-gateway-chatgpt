@@ -5,6 +5,7 @@ import {
   assertJsonResponse,
   assertSuccessfulResponse,
   isGatewayAcceptanceConfigured,
+  normalizeAcceptanceOrigin,
   openAiAnyOfBody,
   openAiInvalidJsonEnvelope,
   readGatewayAcceptanceConfig,
@@ -15,7 +16,7 @@ import type { GatewayAcceptanceConfig } from "./acceptance_support.ts";
 function readAcceptanceOrigin(): string | undefined {
   try {
     const value = Deno.env.get("RELAY_ACCEPTANCE_ORIGIN");
-    return value === undefined || value.trim().length === 0 ? undefined : value;
+    return normalizeAcceptanceOrigin(value);
   } catch {
     return undefined;
   }
