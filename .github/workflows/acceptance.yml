@@ -13,16 +13,35 @@ jobs:
     environment: protected-acceptance
     env:
       RELAY_ACCEPTANCE_ORIGIN: ${{ vars.RELAY_ACCEPTANCE_ORIGIN }}
+      RELAY_ACCEPTANCE_RELAY_SECRET: ${{ secrets.RELAY_ACCEPTANCE_RELAY_SECRET }}
+      RELAY_ACCEPTANCE_GATEWAY_BASE_URL: ${{ vars.RELAY_ACCEPTANCE_GATEWAY_BASE_URL }}
+      RELAY_ACCEPTANCE_MODEL: ${{ vars.RELAY_ACCEPTANCE_MODEL }}
+      RELAY_ACCEPTANCE_GATEWAY_TOKEN: ${{ secrets.RELAY_ACCEPTANCE_GATEWAY_TOKEN }}
+      RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY: ${{ secrets.RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
-      - name: Skip when no acceptance origin is configured
-        if: ${{ vars.RELAY_ACCEPTANCE_ORIGIN == '' }}
+      - name: Validate protected acceptance configuration
         run: |
-          echo "RELAY_ACCEPTANCE_ORIGIN is not configured; skipping."
-          exit 0
+          set -eu
+          missing=0
+          for name in \
+            RELAY_ACCEPTANCE_ORIGIN \
+            RELAY_ACCEPTANCE_RELAY_SECRET \
+            RELAY_ACCEPTANCE_GATEWAY_BASE_URL \
+            RELAY_ACCEPTANCE_MODEL \
+            RELAY_ACCEPTANCE_GATEWAY_TOKEN \
+            RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY
+          do
+            if [ -z "${!name:-}" ]; then
+              printf '%s is not configured\n' "$name"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
       - name: Run acceptance tests
-        if: ${{ vars.RELAY_ACCEPTANCE_ORIGIN != '' }}
         run: deno test --allow-net --allow-env apps/deno-relay/acceptance_test.ts
