@@ -190,6 +190,9 @@ AI Gateway Custom Provider、実 Deno Deploy relay、実 Command Code Provider A
 acceptance を手動実行します。必須値は次のとおりです。
 
 - `RELAY_ACCEPTANCE_ORIGIN`: legacy relay の直接検証先
+- `RELAY_ACCEPTANCE_RELAY_SECRET`: legacy direct acceptance の認証にだけ使用する protected
+  acceptance secret。runtime 用の `RELAY_SECRET` とは管理・注入経路を分離し、workflow の
+  ログや request body に出力しません
 - `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`: `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}`
   形式の Gateway base URL
 - `RELAY_ACCEPTANCE_MODEL`: Command Code の検証用 model ID

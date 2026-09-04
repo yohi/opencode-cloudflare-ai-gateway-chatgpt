@@ -193,13 +193,34 @@
       返す。reader は `request.signal` と固定 30 秒の body timeout
       に連動させ、abort/timeout および既知の `Content-Length` による早期 `413`
       では reader を cancel する。
-    - parse failure、413、body timeout、client abort、upstream error、response
-      completion の全経路で normalization slot を一度だけ解放する。
+    - normalization slot は、取得後の parse failure、`413`、body timeout、client
+      abort、または upstream fetch error
+      の各経路で、保持中であれば一度だけ解放する。 正常系では counted reader と
+      patch assembly が完了し、upstream request body が
+      以後不要になった時点で、response completion
+      を待たずに一度だけ解放する。正常系で 先に解放した後の upstream fetch error
+      や response completion が normalization slot を再度解放してはならない。
+    - upstream response の streaming concurrency を制限する場合は、normalization
+      slot とは別の response-streaming counter を取得する。response-streaming
+      counter は client abort、upstream error、response completion
+      の各経路で、保持中であれば一度だけ 解放し、normalization slot
+      の解放と混同してはならない。
     - `tools`、`tools[].function`、`tools[].function.parameters`、`tools[].input_schema`
       の対象 member が同一 object scope に重複する場合、effective member
-      を推測せず route-specific な
-      `400`（`duplicate_json_member`）を返し、normalization/upstream fetch
-      を実行しない。scanner と normalizer は同じ raw member spans を使用する。
+      を推測せず route-specific な `400` を返し、normalization/upstream fetch
+      を実行しない。response は常に `Content-Type: application/json`
+      とし、malformed JSON 用 envelope は再利用せず、次の provider-compatible
+      envelope を固定する。 OpenAI `/v1/chat/completions` では `error.code` に
+      `duplicate_json_member` を設定し、`error.type` は `invalid_request_error`
+      のままとする。 body は
+      `{"error":{"message":"Duplicate JSON object member","type":"invalid_request_error","param":null,"code":"duplicate_json_member"}}`
+      とする。Anthropic `/v1/messages` では provider-native な `error.type` を
+      `invalid_request_error` のままにし、nested `error.code` に
+      `duplicate_json_member` を設定する relay extension とする。body は
+      `{"type":"error","error":{"type":"invalid_request_error","message":"Duplicate JSON object member","code":"duplicate_json_member"}}`
+      とする。どちらも secret、credential、member 名、request body
+      内容を含めない。 scanner と normalizer は同じ raw member spans
+      を使用する。
     - counted reader が上限以下で完了した body だけを lossless scanner/transform
       に渡す。 上限ちょうどの body は許可し、`4 MiB + 1` byte
       は拒否する。`Content-Length` は 上限超過の早期拒否にだけ使用し、実 body の
@@ -521,8 +542,8 @@ whitespace のみの場合は request-time に `503 Service unavailable`
   検証する。
 - generic `GET /upstream/command-code/v1/models` が `If-None-Match` または
   `If-Modified-Since` を付けて upstream へ送られ、upstream の `304 Not Modified`
-  の status、サニタイズ後の headers、body が downstream へ pass-through される
-  ことを検証する。upstream fetch call count は `1` とする。
+  の status、サニタイズ後の headers、空 body が downstream へ pass-through
+  される ことを検証する。upstream fetch call count は `1` とする。
 - legacy `/v1/responses` は既存の redirect pass-through
   契約を維持することを別テストで 検証する。
 - config loader は env 未設定、正の整数

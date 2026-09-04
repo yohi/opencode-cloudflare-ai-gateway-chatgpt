@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Preserve the existing legacy `POST /v1/responses` contract, including redirect pass-through.
-- For generic `/upstream/*`, set `RequestInit.redirect` to `"manual"`, pass through `304`, and reject all other 3xx statuses with the stable `502` error envelope.
+- For generic `/upstream/*`, set `RequestInit.redirect` to `"manual"`, pass through the upstream `304` status and sanitized response headers with an empty downstream body, and reject all other 3xx statuses with the stable `502` error envelope.
 - Retain `If-None-Match` and `If-Modified-Since`; do not introduce a cache or redirect follow.
 - Apply root `anyOf` flattening only to the OpenAI `/v1/chat/completions` schema shape.
 - Preserve Anthropic `/v1/messages` root `anyOf` schemas, including all members and request-body byte spans, without normalization.
@@ -38,7 +38,7 @@
 
 - [x] **Step 1: Define the status partition**
 
-  State that generic `/upstream/*` passes through upstream `304 Not Modified`, including sanitized response headers and body. State that generic `/upstream/*` converts every other 3xx status, including `300`, `301`, `302`, `303`, `305`, `306`, `307`, and `308`, to `502 {"error":"upstream_redirect_not_allowed"}` without forwarding upstream headers/body or performing another fetch. Keep legacy `/v1/responses` 3xx pass-through unchanged.
+  State that generic `/upstream/*` passes through upstream `304 Not Modified` status and sanitized response headers with an empty downstream body. State that generic `/upstream/*` converts every other 3xx status, including `300`, `301`, `302`, `303`, `305`, `306`, `307`, and `308`, to `502 {"error":"upstream_redirect_not_allowed"}` without forwarding upstream headers/body or performing another fetch. Keep legacy `/v1/responses` 3xx pass-through unchanged.
 
 - [x] **Step 2: Define conditional-request behavior**
 

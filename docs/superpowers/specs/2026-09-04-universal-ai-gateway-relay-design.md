@@ -88,14 +88,48 @@ apps/deno-relay/
 
 | コンポーネント | 責務 |
 |---|---|
-| `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取り、`config.ts` の検証済み timeout を依存注入 |
-| `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
+| `main.ts` | `Deno.serve` 起動、runtime raw request-target adapter を介した `RelayRequestContext` の生成、`RELAY_SECRET` 等の環境変数読み取り、`config.ts` の検証済み timeout の依存注入 |
+| `router.ts` | `RelayRequestContext` の raw request-target を使った HTTP method/path 振り分け、認証前の `404` 判定 |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
 | `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、provider-compatible route として定義された POST + `application/json` 時の lossless body scan/transform と route policy に基づく OpenAI / Anthropic schema 正規化、upstream URL 構築。既知 route の JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。未知の route/method、または envelope 未定義 route は JSON parse せず body を raw forward する。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の `304` 以外の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。generic route は `304` を pass-through し、それ以外の 3xx を拒否する。legacy route は既存の 3xx を互換 pass-through する |
 | `schema.ts` | provider preset から明示的に渡された route policy に従い、OpenAI の `tools[].function.parameters` または Anthropic の `tools[].input_schema` を正規化する。provider policy を body member 名から推測しない |
 | `config.ts` | `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` を既定値・範囲付き整数 milliseconds として parse し、不正値で fail-closed にする |
-| `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
+| `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher`、`RawRequestTargetRuntime`、`RelayRequestContext` 等の共有型 |
+
+### 3.4 `Deno.serve` と router の raw request-target adapter
+
+`Deno.serve` が渡す `Request` の `url` は URL parser による normalization 後の値に
+なり得るため、router は `request.url` から raw request-target を再構成してはならない。
+`main.ts` と `router.ts` の境界は、runtime が提供する raw 値を明示的に受け渡す次の
+adapter/runtime API とする。
+
+```ts
+export type RawRequestTargetRuntime = {
+  readonly readRawRequestTarget: (
+    request: Request,
+  ) => string | undefined;
+};
+
+export type RelayRequestContext = {
+  readonly request: Request;
+  readonly rawRequestTarget: string | undefined;
+};
+```
+
+`main.ts` の `Deno.serve` callback は runtime adapter の
+`readRawRequestTarget(request)` を URL normalization 前に呼び出し、その戻り値を
+`RelayRequestContext.rawRequestTarget` として router へ渡す。runtime が raw target を
+提供できない場合は `undefined` を渡し、adapter は `request.url`、`URL.pathname`、または
+その他の normalization 後の値から raw target を推測してはならない。raw target は origin-form
+の path と query を含む元の request-target とし、router は最初の `?` だけで path と query
+を分離する。
+
+router は `RelayRequestContext.rawRequestTarget` と `request.url` の対応を検証し、raw 値が
+取得不能、欠落、または normalization 前の入力と一致することを証明できない場合、generic
+route を `404 Not Found` として終了する。この場合は provider credential の解決・付与を
+含め、upstream fetch を実行してはならない。adapter の runtime 実装が変わっても、この
+fail-closed context 契約と router の入力型を変更してはならない。
 
 ## 4. リクエスト処理フロー
 
@@ -104,6 +138,9 @@ apps/deno-relay/
 ```text
 [Client / Cloudflare AI Gateway]
         │
+        ▼
+[Deno.serve + raw request-target adapter]
+        │ RelayRequestContext
         ▼
 [router.ts]
    ├─ POST /v1/responses ──▶ [chatgpt.ts]
@@ -162,11 +199,12 @@ apps/deno-relay/
 - generic route の `Location` が absolute cross-origin、absolute same-provider、relative
   のいずれであっても拒否する。`307` / `308` でも、元の POST body は最初の upstream
   request に 1 回だけ送られ、relay は redirect 先へ再送しない。
-- router は runtime が提供する raw request-target を URL normalization 前に取得し、最初の `?`
-  で path と query を分離してから path suffix の containment を検証する。raw request-target を
-  取得できない、または normalization 前の値と一致することを証明できない場合は `404 Not Found`
-  として upstream fetch を行わない。`/./`、`/../`、percent-encoded dot segment、encoded
-  separator を含む suffix は URL constructor による解決結果ではなく raw path 上で拒否する。
+- router は `RelayRequestContext.rawRequestTarget` を最初の `?` で path と query に分離してから
+  path suffix の containment を検証する。`request.url` のみを routing/security 判定に使用しては
+ ならない。`/./`、`/../`、percent-encoded dot segment、encoded separator を含む suffix は
+  URL constructor による解決結果ではなく raw path 上で拒否する。raw request-target を取得
+  できない、または normalization 前の値と一致することを証明できない場合は `404 Not Found`
+  として upstream fetch を行わない。
 - SSE 応答の場合、120 秒のアイドルタイムアウトを適用
 - upstream fetch の header timeout は応答ヘッダー受信時に停止し、SSE idle timeout は
   その時点から開始して各 body chunk の受信ごとにリセットする。header timeout が
@@ -234,8 +272,16 @@ failure は provider-compatible envelope が定義された既知 route にだ�
   - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters`、`input_schema` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
   - 認識済み route では、同一 object scope に `tools`、`tools[].function`、`tools[].function.parameters`、
     または `tools[].input_schema` の対象 member が重複している場合、effective member を推測せず
-    route-specific な `400` JSON error（`duplicate_json_member`）を返し、normalization と upstream
-    fetch を行わない。scanner の重複検出と normalizer の対象選択は同じ raw member spans を使用する。
+    route-specific な `400` JSON error を返し、normalization と upstream fetch を行わない。
+    response は常に `Content-Type: application/json` とし、malformed JSON 用 envelope は再利用しない。
+    OpenAI `/v1/chat/completions` では `error.code` に `duplicate_json_member` を設定し、
+    `error.type` は `invalid_request_error` のままとする。body は
+    `{"error":{"message":"Duplicate JSON object member","type":"invalid_request_error","param":null,"code":"duplicate_json_member"}}`
+    とする。Anthropic `/v1/messages` では `error.type` を `invalid_request_error` のままにし、
+    nested `error.code` に `duplicate_json_member` を設定する relay extension とする。body は
+    `{"type":"error","error":{"type":"invalid_request_error","message":"Duplicate JSON object member","code":"duplicate_json_member"}}`
+    とする。どちらも secret、credential、member 名、request body 内容を含めない。scanner の
+    重複検出と normalizer の対象選択は同じ raw member spans を使用する。
   - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
 1. **OpenAI route の `anyOf` 互換性変換（意図的な意味の狭め込み）**
@@ -358,7 +404,7 @@ schema の意味を維持するため `tools[].input_schema` の root `anyOf` �
 | 既知 provider route の normalization body 上限超過 | `413` | route-specific provider-compatible error envelope | `MAX_NORMALIZATION_BODY_BYTES` を超えた時点で reader を cancel し、upstream fetch を実行しない |
 | normalization slot 上限到達 | `503` | `{"error":"normalization_capacity_exhausted"}` | 最大 `16` slot を body buffering 前に非待機取得し、reader を消費せず upstream fetch 前に返す |
 | normalization body timeout | `408` | `{"error":"request_body_timeout"}` | 固定 30 秒。reader を cancel し、upstream fetch 前に返す |
-| 認識済み route の JSON member 重複 | `400` | route-specific provider-compatible error envelope | `duplicate_json_member` として normalization/upstream fetch 前に返す |
+| 認識済み route の JSON member 重複 | `400` | route-specific provider-compatible error envelope（`Content-Type: application/json`） | OpenAI は `error.code`、Anthropic は nested `error.code` に `duplicate_json_member` を設定し、malformed JSON 用 envelope を再利用せず normalization/upstream fetch 前に返す |
 | envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
 | generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers、空 body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
 | generic `/upstream/*` の upstream `304` 以外の 3xx（`300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`） | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
@@ -376,6 +422,16 @@ error shape を使用する。`/v1/chat/completions` は OpenAI shape
 envelope を定義してから provider-compatible route として有効化する。envelope 未定義の
 route/method は JSON parse せず body を raw forward し、universal な
 `{"error":"invalid_json_body"}` は返さない。
+
+認識済み route の重複 JSON member は malformed JSON とは別の validation error として扱う。
+`/v1/chat/completions` は `Content-Type: application/json` と
+`{"error":{"message":"Duplicate JSON object member","type":"invalid_request_error","param":null,"code":"duplicate_json_member"}}`
+を返し、`duplicate_json_member` は `error.code` に設定する。`/v1/messages` は同じ
+`Content-Type` と
+`{"type":"error","error":{"type":"invalid_request_error","message":"Duplicate JSON object member","code":"duplicate_json_member"}}`
+を返し、`duplicate_json_member` は nested `error.code` に設定する relay extension
+とする。重複検出時は normalization と upstream fetch を行わず、body 内容や member 名を
+error response に含めない。
 
 既存 `/v1/responses` の upstream 3xx は後方互換のため、従来どおり status、サニタイズ
 後の headers（`Location` を含む）、body を pass-through する。上記の `502` 契約は
@@ -508,8 +564,10 @@ route/request shape を混同しない別ケースとして扱う。
 - root `type` が `"string"`、`"array"`、または複合型の配列である anyOf は flatten と補完を
   行わず、対象 schema を byte-for-byte 保持すること
 - `tools`、`tools[].function`、`tools[].function.parameters`、`tools[].input_schema` の
-  重複 JSON member を route ごとに検出し、`duplicate_json_member` の `400`、normalization
-  skip、upstream fetch call count `0` となること
+  重複 JSON member を route ごとに検出し、`Content-Type: application/json` の exact
+  provider-specific `400` envelope、normalization skip、upstream fetch call count `0`
+  となること。OpenAI は `error.code`、Anthropic は nested `error.code` に
+  `duplicate_json_member` を設定し、malformed JSON 用 envelope を再利用しないこと
 - body buffering 前の normalization slot 上限 `16` を超えた場合、reader を消費せず
   `503 {"error":"normalization_capacity_exhausted"}` を返すこと。parse failure、413、body
   timeout、client abort、upstream error、body assembly 完了の各経路で slot が一度だけ解放され、
@@ -526,9 +584,9 @@ route/request shape を混同しない別ケースとして扱う。
 - `/upstream/command-code/v1/messages` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/messages` 完全一致）
 - `/upstream/command-code//attacker.example/collect` と `/upstream/command-code///attacker.example/collect` が `404` となり、attacker への fetch が発生しないこと
 - `/upstream/command-code/../other`、`/upstream/command-code/./other`、および到達可能な percent-encoded dot segment/encoded separator が containment 違反として扱われ、異常ケースごとに upstream fetch call count が `0` であること
-- raw request-target が取得不能、または normalization 前の値と一致しない場合に `404` となり、
-  `/./`、`/../`、percent-encoded dot segment、encoded separator の各ケースで upstream fetch
-  call count が `0` であること
+- raw request-target adapter が `undefined` を返す、または normalization 前の値との一致を
+  証明できない場合に `404` となり、`/./`、`/../`、percent-encoded dot segment、encoded
+  separator の各ケースで upstream fetch call count が `0` であること
 - containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
