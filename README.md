@@ -144,6 +144,14 @@ span を入力のまま保持します。OpenAI route で flatten できない `
 ない場合、または OpenAI route で安全な flatten に成功した場合だけ、欠落した `type` や
 `properties` を補完します。
 
+認識済み provider-compatible JSON route の正規化 body には、
+`MAX_NORMALIZATION_BODY_BYTES = 4 * 1024 * 1024`（4 MiB）の固定上限があります。
+正しい `Content-Length` が上限を超える場合は body を読み切らず、欠落・不正・複数値の
+`Content-Length` では counted reader が上限超過を検出した時点で reader を cancel し、
+route-specific な `413` JSON error を返します。部分 body を upstream へ送ることは
+ありません。legacy `/v1/responses`、未知 route/method、normalization policy 未定義の
+route はこの buffering 上限の対象外で、従来どおり raw streaming されます。
+
 provider preset が malformed JSON の envelope を定義した既知 route では、`POST` かつ
 `Content-Type` の media type が `application/json` の body を解析できない場合、route-specific
 な provider-compatible `400` envelope を upstream fetch 前に返します。`/v1/chat/completions` は OpenAI shape
@@ -173,6 +181,26 @@ payload persistence、または credential/payload のアプリケーション�
 - **120 秒の SSE idle タイマー**: upstream ヘッダー受信後に開始し、upstream body chunk を受信するたびにリセットします。総時間ではありません。期限切れの場合、upstream request を abort し、`upstream_sse_idle_timeout` stream error で downstream stream を終了します。応答ヘッダーは既に送信済みのため、2 番目の HTTP status や body に置き換えることはありません。非 SSE 応答には relay による総時間制限はありません。
 - **inbound abort signal**: inbound request の abort signal を upstream fetch signal に連結します。OpenCode client が upstream ヘッダー到達前に切断/キャンセルした場合、upstream fetch を abort し応答を送信しません。ストリーム開始後に切断した場合、upstream response body をキャンセルし downstream stream を閉じます。これらのキャンセル経路は fallback や retry を一切引き起こしません。
 - **timeout env validation**: `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` は起動時に検証します。未設定時はそれぞれ `30000` / `120000`、空文字列や `0`、負数、非数値、小数、上限超過値は設定エラーです。有効値は前後の ASCII whitespace を除去した 1 以上 `3_600_000` 以下の整数 milliseconds とし、不正値では default に戻らず `Deno.serve` を開始しない fail-closed 起動失敗とします。
+
+### Protected acceptance
+
+`.github/workflows/acceptance.yml` の `protected-acceptance` environment から、実 Cloudflare
+AI Gateway Custom Provider、実 Deno Deploy relay、実 Command Code Provider API を通る
+acceptance を手動実行します。必須値は次のとおりです。
+
+- `RELAY_ACCEPTANCE_ORIGIN`: legacy relay の直接検証先
+- `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`: `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}`
+  形式の Gateway base URL
+- `RELAY_ACCEPTANCE_MODEL`: Command Code の検証用 model ID
+- `RELAY_ACCEPTANCE_GATEWAY_TOKEN`: Gateway token secret
+- `RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`: Command Code API key secret
+
+acceptance は `tools[].function.parameters` に次の safe root `anyOf` を含む OpenAI
+`/v1/chat/completions` request と、同じ schema を `tools[].input_schema` に含む Anthropic
+`/v1/messages` request を実providerへ送信します。OpenAI route は validator を通過し、
+Anthropic route は root `anyOf` を保持したまま成功することを確認します。両 route の
+malformed/empty JSON envelope、`/v1/models`、path mapping、credential separation も
+確認します。必要な変数またはsecretが未設定の場合、workflowはskipせず失敗します。
 
 ## サポート対象バージョンとフェイルクローズ
 
@@ -234,7 +262,7 @@ PAT (classic) を準備してください。
 
 1. [ ] OpenCode が `PluginInput` でホストバージョン能力を公開したリリースが出ていること。さらに activate 拒否時にホスト側が一致する Codex リクエストを block できること（拒否だけでは direct request を防げない）。
 2. [ ] `SUPPORTED_OPENCODE_RANGE` と `peerDependencies.opencode` を実際の能力提供バージョンに更新し、`test/package-consistency.test.ts` を通すこと。
-3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth / Command Code 認証情報）を `protected-acceptance` 環境で実行し、legacy の 200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモードに加え、generic `command-code` の OpenAI/Anthropic/models path、provider-compatible error envelope、header injection、Gateway log 作成、パスマッピングを確認すること。必須値が未設定の場合は skip せず fail させること。
+3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth / Command Code 認証情報）を `protected-acceptance` 環境で実行し、legacy の 200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモードに加え、固定の safe root `anyOf` fixture を使った generic `command-code` の OpenAI/Anthropic/models path、provider-compatible error envelope、header injection、Gateway log 作成、パスマッピングを確認すること。`MAX_NORMALIZATION_BODY_BYTES` の上限超過契約も実装テストで確認し、必須値が未設定の場合は skip せず fail させること。
 4. [ ] README のサポート範囲表記を更新すること。
 5. [ ] 初回の手動公開前に、`write:packages` 権限を持つ GitHub PAT
    (classic) で GitHub Packages registry に認証すること。その後、

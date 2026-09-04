@@ -175,6 +175,14 @@ apps/deno-relay/
 - ボディが JSON としてパース可能であること
 - `body.tools` が配列であること
 - 全体の `JSON.parse` → `JSON.stringify` ではなく、raw/token-preserving な変換を適用できること
+- body byte size が `MAX_NORMALIZATION_BODY_BYTES = 4 * 1024 * 1024`（4 MiB）以下であること。これは
+  platform limit ではなく、認識済み normalization route のアプリケーションメモリ予算であり、
+  運用環境の環境変数で引き上げてはならない。単一の正しい decimal `Content-Length` が上限を
+  超える場合は body を読み切らず `413` を返す。`Content-Length` が欠落、不正、または複数値で
+  解釈できない場合は inbound `ReadableStream` を byte counter 付きで読み、上限を超える次の
+  chunk を検出した時点で reader を cancel し、部分 body を upstream へ渡さない。上限ちょうど
+  は許可し、`4 MiB + 1` byte は拒否する。実 body と `Content-Length` が異なる場合は byte counter
+  の結果を正とする。
 
 route pathname を API request shape の主な識別子とし、対象 schema member は次のように
 固定する。
@@ -324,6 +332,7 @@ schema の意味を維持するため `tools[].input_schema` の root `anyOf` �
 | 未知の provider slug | `404` | `Not Found` | upstream fetch 前 |
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
 | 既知 provider route のリクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | `command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
+| 既知 provider route の normalization body 上限超過 | `413` | route-specific provider-compatible error envelope | `MAX_NORMALIZATION_BODY_BYTES` を超えた時点で reader を cancel し、upstream fetch を実行しない |
 | envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
 | generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers/body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
 | generic `/upstream/*` の upstream `304` 以外の 3xx（`300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`） | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
@@ -369,6 +378,15 @@ secret、credential、request body を含めない。`main.ts` は loader の結
 injection し、handler は受け取った milliseconds を header timeout と SSE idle timeout
 の実処理へ伝播させる。`RELAY_SECRET` 未設定時の既存 `503` 契約は変更しない。
 
+`MAX_NORMALIZATION_BODY_BYTES` は `4 * 1024 * 1024`（4 MiB）の固定実装値とする。上限超過時の
+`/v1/chat/completions` response は
+`{"error":{"message":"Request body exceeds maximum normalization size","type":"invalid_request_error","param":null,"code":"request_body_too_large"}}`、
+`/v1/messages` response は
+`{"type":"error","error":{"type":"invalid_request_error","message":"Request body exceeds maximum normalization size"}}`
+とし、いずれも `Content-Type: application/json`、secret/credential/body 内容なし、upstream
+fetch なしとする。未知 route/method または envelope 未定義 route はこの上限の対象外であり、
+既存どおり raw forward する。
+
 ### 7.2 プリセットプロバイダ
 
 | provider-slug | upstream base URL | クライアントからの path suffix 例 |
@@ -394,6 +412,10 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - **基盤プラットフォーム**: Deno Deploy
 - **処理場所と CPU リスクの分離**: 大容量リクエストの JSON scan/transform は Deno Deploy relay で実行し、Cloudflare Workers Free の 10ms CPU 制限を relay の処理に持ち込まないこと。Deno Deploy の CPU 無制限を前提にせず、対象 plan/runtime の計測値と SLO で受け入れ判定する
 - **メモリ予算**: 1 リクエストの process/heap high-water を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno Deploy 共通の platform limit とは仮定しない
+- **正規化 body のアプリケーション上限**: 認識済み provider-compatible JSON route の
+  `MAX_NORMALIZATION_BODY_BYTES` を 4 MiB に固定する。4 MiB 以下での buffering、scan、patch
+  assembly の process/heap high-water を target runtime で計測し、512 MB の保守的予算に対する
+  安全余裕を確認する。4 MiB は platform limit ではない。
 - **ゼロ外部依存**: Deno 標準 API のみで実装する
 - **レイテンシオーバーヘッド SLO（初期値）**: 受信済み body bytes の scan/transform 開始から、upstream fetch を開始できる request body と header の準備完了までを計測区間とする。network 転送、upstream 待ち時間、cold start は含めない
 - **SLO の測定条件**: body size 700 KiB、1 MiB、2 MiB、4 MiB、warm な Deno Deploy instance、単一同時実行で p95 を測定する。JSON scan/transform と header 処理を合わせた p95 は各サイズで 10ms 未満を初期目標とする。これは Cloudflare または Deno Deploy の platform limit ではなく、測定可能な product SLO である
@@ -437,6 +459,12 @@ route/request shape を混同しない別ケースとして扱う。
 - scanner が valid JSON の token boundary を安全に確定できないと判定したケースでは、部分再シリアライズを行わず、元の body bytes がそのまま upstream に渡されて正規化がスキップされること。判定条件またはテスト用の failure injection を固定し、400 の JSON parse failure と混同しないこと
 - `anyOf` 要素がオブジェクトでない場合は、`type` / `properties` 補完を含め無改変
 - 空 `tools` 配列の場合の無改変
+- 正規化対象 body の `MAX_NORMALIZATION_BODY_BYTES` が `4 * 1024 * 1024` bytes で固定され、
+  body が上限ちょうどなら許可され、`4 MiB + 1` byte は `Content-Length` の事前判定で
+  `413` となること。上限超過時の upstream fetch call count は `0` であること
+- `Content-Length` が欠落、不正、または複数値の body は counted reader で検査し、上限を
+  超える次の chunk で reader を cancel して同じ `413` envelope を返すこと。部分 bodyを
+  upstream へ送らず、secret、credential、body 内容を error response に含めないこと
 
 ### 9.2 relay_test.ts（既存を拡張）
 
@@ -485,6 +513,8 @@ route/request shape を混同しない別ケースとして扱う。
 - 複数 tools の body で、先行 patch による body 長の増加後も後続 patch が正しい tool schema に適用されること
 - body を UTF-8 bytes として比較し、正規化対象 span 以外の bytes が入力と完全一致すること（JS object の deep equality だけで判定しない）
 - unsafe integer を含む JSON body で tools の正規化を行っても、upstream で unsafe integer の number token が入力どおり保持されること
+- 認識済み route の body が `4 MiB + 1` byte の場合、`Content-Length` の有無にかかわらず
+  `413` とし、上流へ部分 body を送らず、reader の cancel が完了すること
 - valid JSON でも scanner が token span を安全に確定できないと判定した body は、`400` にせず、部分的な再シリアライズなしに元の body bytes のまま upstream へ転送されること
 - 既存 `/v1/responses` テスト（SSE、header timeout、SSE idle timeout、client abort、header sanitization を含む）の維持
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
@@ -519,6 +549,12 @@ route/request shape を混同しない別ケースとして扱う。
   acceptance は別のテスト群として実装する。後者は実 Cloudflare AI Gateway Custom
   Provider、実 Deno Deploy relay、実 Command Code Provider API を通る手動 workflow
   でのみ実行し、mock の統合テストを代替証拠としない。
+- OpenAI の具体的な safe root `anyOf` fixture
+  `{"anyOf":[{"type":"object","properties":{"query":{"type":"string"}}},{"type":"object","properties":{"limit":{"type":"integer"}}}]}`
+  を `tools[].function.parameters` に設定した request を Gateway へ送り、Command Code
+  の実 provider validator を通過して成功することを確認する。Anthropic では同じ fixture
+  を `tools[].input_schema` に設定し、`/v1/messages` の root `anyOf` を保持したまま
+  成功することを確認する。mock のみでこの判定を代替してはならない。
 - 汎用 acceptance は、OpenAI の
   `.../custom-command-code/v1/chat/completions`、Anthropic の
   `.../custom-command-code/v1/messages`、両 SDK の `/v1/models` に対応する request
@@ -532,6 +568,13 @@ route/request shape を混同しない別ケースとして扱う。
 - Gateway base URL、Gateway token、Command Code API key は protected Environment の
   variables/secrets から注入し、workflow のログへ出力しない。必須値が欠落した場合は
   skip せず release gate を fail させる。
+- test runner の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
+  `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、`RELAY_ACCEPTANCE_MODEL`、
+  `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY` とする。
+  `RELAY_ACCEPTANCE_ORIGIN` は legacy relay の直接検証、Gateway base URL は
+  `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}` 形式の実 Custom Provider
+  経路に使用する。`RELAY_SECRET` は Custom Provider の protected header 設定にのみ
+  保存し、test runner のログや request body に出力しない。
 
 ## 10. Future 拡張（Roadmap）
 

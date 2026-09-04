@@ -2,9 +2,9 @@
 
 > **For agentic workers:** Execute this plan inline in the current session. Do not dispatch subagents.
 
-**Goal:** Align the universal relay's documented status policy and provider-specific schema normalization contract with the validated review findings before the universal relay implementation begins.
+**Goal:** Align the universal relay's documented status policy, provider-specific schema normalization contract, memory bound, and protected acceptance requirements with the validated review findings before the universal relay implementation begins.
 
-**Architecture:** Keep the existing legacy `POST /v1/responses` behavior unchanged. The future generic relay will pass through upstream `304 Not Modified` responses, reject every other 3xx status without following it, and retain conditional request headers. Its schema normalizer will receive the provider route shape explicitly: OpenAI may use the existing safe root `anyOf` flattening, while Anthropic preserves root `anyOf` schemas byte-for-byte. This change updates the requirements, design, README, and implementation plan only; it does not add generic relay runtime code that is not yet present.
+**Architecture:** Keep the existing legacy `POST /v1/responses` behavior unchanged. The future generic relay will pass through upstream `304 Not Modified` responses, reject every other 3xx status without following it, and retain conditional request headers. Its schema normalizer will receive the provider route shape explicitly: OpenAI may use the existing safe root `anyOf` flattening, while Anthropic preserves root `anyOf` schemas byte-for-byte. Recognized JSON normalization routes have a fixed 4 MiB body bound with fail-closed `413` handling. Protected acceptance uses concrete provider-facing fixtures through Cloudflare AI Gateway, Deno Deploy, and Command Code. This change updates the requirements, design, README, and acceptance contract only; it does not add generic relay runtime code that is not yet present.
 
 **Tech Stack:** Markdown requirements and design documents, Deno relay test strategy, GitHub-flavored Markdown.
 
@@ -18,6 +18,9 @@
 - Keep generic relay behavior fail-closed and avoid direct ChatGPT fallbacks, retry loops, caching, and payload persistence.
 - Keep `apps/deno-relay` free of runtime dependencies.
 - Preserve raw/token-level bytes outside explicitly normalized schema spans.
+- Fix `MAX_NORMALIZATION_BODY_BYTES` at `4 * 1024 * 1024` for recognized JSON normalization routes; do not expose an override that can exceed it.
+- Reject oversized recognized bodies before upstream fetch, count bytes when `Content-Length` is unavailable or invalid, and cancel the reader at the first exceeding chunk.
+- Protected acceptance must use a concrete safe root `anyOf` fixture against the real provider; missing protected variables must fail the workflow instead of skipping.
 - Do not add relay implementation ahead of the existing design-only scope.
 
 ---
@@ -93,3 +96,28 @@
 - [x] **Step 4: Commit and push the contract fix**
 
   Create one Japanese Conventional Commit for the requirements/design contract correction, then push the current feature branch without force. Do not commit directly to `master` and do not merge a pull request.
+
+### Task 4: Follow-up safety and protected acceptance contract
+
+**Files:**
+- Modify: `REQUIREMENTS_AI_GATEWAY_RELAY.md`
+- Modify: `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md`
+- Modify: `README.md`
+- Modify: `apps/deno-relay/acceptance_test.ts`
+- Modify: `.github/workflows/acceptance.yml`
+
+**Interfaces:**
+- Consumes: The route-explicit normalizer contract and `protected-acceptance` environment.
+- Produces: A fixed 4 MiB body safety contract and provider-facing acceptance coverage.
+
+- [x] **Step 1: Add the 4 MiB normalization bound**
+
+  Require `Content-Length` early rejection and counted-reader cancellation for recognized JSON routes, route-specific `413` envelopes, zero upstream fetches, and unchanged legacy/unknown-route streaming.
+
+- [x] **Step 2: Add a concrete provider fixture**
+
+  Require the disjoint object-branch root `anyOf` fixture under OpenAI `tools[].function.parameters` and Anthropic `tools[].input_schema`, with the former flattened only by the OpenAI policy and the latter preserved.
+
+- [x] **Step 3: Add executable protected acceptance**
+
+  Add real Gateway URL requests for OpenAI, Anthropic, and models, route-specific malformed JSON checks, secret-free failure messages, and a workflow preflight that fails when any required variable or secret is absent.
