@@ -90,6 +90,39 @@ Deno.test(
 );
 
 Deno.test(
+  "cancels an unexpected JSON response without reading its body",
+  async () => {
+    let bodyRead = false;
+    let bodyCanceled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        bodyRead = true;
+        controller.enqueue(new TextEncoder().encode("unexpected-body"));
+        controller.close();
+      },
+      cancel() {
+        bodyCanceled = true;
+      },
+    });
+    const error = await captureError(() =>
+      assertJsonResponse(new Response(body, { status: 502 }), {
+        body: "expected-body",
+        label: "Gateway envelope",
+        status: 400,
+      })
+    );
+
+    assert(
+      error.message ===
+        "Gateway envelope returned an unexpected status: expected 400, received 502",
+      "did not report the expected and actual statuses",
+    );
+    assert(!bodyRead, "read the unexpected response body");
+    assert(bodyCanceled, "did not cancel the unexpected response body");
+  },
+);
+
+Deno.test(
   "does not include the response body in a JSON envelope mismatch",
   async () => {
     const unexpectedBody = "provider-response-that-must-not-be-logged";

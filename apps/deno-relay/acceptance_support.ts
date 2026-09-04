@@ -163,12 +163,13 @@ export async function assertJsonResponse(
   response: Response,
   expected: ExpectedJsonResponse,
 ): Promise<void> {
-  const body = await response.text();
   if (response.status !== expected.status) {
+    await response.body?.cancel();
     throw new Error(
       `${expected.label} returned an unexpected status: expected ${expected.status}, received ${response.status}`,
     );
   }
+  const body = await response.text();
   if (body !== expected.body) {
     throw new Error(
       `${expected.label} returned an unexpected error envelope`,
