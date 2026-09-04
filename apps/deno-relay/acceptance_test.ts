@@ -21,7 +21,17 @@ function readAcceptanceOrigin(): string | undefined {
   }
 }
 
+function readAcceptanceRelaySecret(): string | undefined {
+  try {
+    const value = Deno.env.get("RELAY_ACCEPTANCE_RELAY_SECRET");
+    return value === undefined || value.trim().length === 0 ? undefined : value;
+  } catch {
+    return undefined;
+  }
+}
+
 const origin = readAcceptanceOrigin();
+const relaySecret = readAcceptanceRelaySecret();
 const gatewayAcceptanceConfigured = isGatewayAcceptanceConfigured();
 
 type ProtectedAcceptanceTest = (
@@ -43,16 +53,15 @@ function protectedAcceptanceTest(
 
 Deno.test({
   name: "acceptance: relay rejects wrong method with 404",
-  ignore: origin === undefined,
+  ignore: origin === undefined || relaySecret === undefined,
   fn: async () => {
-    if (origin === undefined) {
+    if (origin === undefined || relaySecret === undefined) {
       return;
     }
     const response = await fetch(`${origin}/v1/responses`, {
       method: "GET",
       headers: {
-        "X-ChatGPT-Relay-Authorization":
-          `Bearer ${readGatewayAcceptanceConfig().relaySecret}`,
+        "X-ChatGPT-Relay-Authorization": `Bearer ${relaySecret}`,
       },
       signal: AbortSignal.timeout(acceptanceTimeoutMs),
     });
