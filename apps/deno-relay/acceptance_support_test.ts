@@ -1,5 +1,7 @@
 import {
   assertJsonResponse,
+  assertSuccessfulResponse,
+  isGatewayAcceptanceConfigured,
   requestThroughGateway,
 } from "./acceptance_support.ts";
 
@@ -8,6 +10,100 @@ function assert(condition: boolean, message: string): void {
     throw new Error(message);
   }
 }
+
+async function captureError(action: () => Promise<void>): Promise<Error> {
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof Error) {
+      return error;
+    }
+    throw new Error("expected an Error instance");
+  }
+  throw new Error("expected the action to throw");
+}
+
+Deno.test("detects complete protected acceptance configuration", () => {
+  const values = new Map([
+    ["RELAY_ACCEPTANCE_GATEWAY_BASE_URL", "https://gateway.ai.cloudflare.com"],
+    ["RELAY_ACCEPTANCE_MODEL", "acceptance-model"],
+    ["RELAY_ACCEPTANCE_GATEWAY_TOKEN", "gateway-token"],
+    ["RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY", "command-code-key"],
+    ["RELAY_ACCEPTANCE_RELAY_SECRET", "relay-secret"],
+  ]);
+
+  assert(
+    isGatewayAcceptanceConfigured((name) => values.get(name)),
+    "did not detect complete protected acceptance configuration",
+  );
+
+  values.set("RELAY_ACCEPTANCE_GATEWAY_TOKEN", " ");
+  assert(
+    !isGatewayAcceptanceConfigured((name) => values.get(name)),
+    "accepted an empty protected acceptance configuration value",
+  );
+});
+
+Deno.test(
+  "reports the actual status for an unsuccessful response",
+  async () => {
+    const error = await captureError(() =>
+      assertSuccessfulResponse(
+        new Response(null, { status: 503 }),
+        "Gateway acceptance",
+      )
+    );
+
+    assert(
+      error.message ===
+        "Gateway acceptance expected a successful response, received 503",
+      "did not report the actual unsuccessful response status",
+    );
+  },
+);
+
+Deno.test(
+  "reports expected and actual statuses for a JSON response mismatch",
+  async () => {
+    const error = await captureError(() =>
+      assertJsonResponse(new Response("unexpected-body", { status: 502 }), {
+        body: "expected-body",
+        label: "Gateway envelope",
+        status: 400,
+      })
+    );
+
+    assert(
+      error.message ===
+        "Gateway envelope returned an unexpected status: expected 400, received 502",
+      "did not report expected and actual JSON response statuses",
+    );
+  },
+);
+
+Deno.test(
+  "does not include the response body in a JSON envelope mismatch",
+  async () => {
+    const unexpectedBody = "provider-response-that-must-not-be-logged";
+    const error = await captureError(() =>
+      assertJsonResponse(new Response(unexpectedBody, { status: 400 }), {
+        body: "expected-body",
+        label: "Gateway envelope",
+        status: 400,
+      })
+    );
+
+    assert(
+      error.message ===
+        "Gateway envelope returned an unexpected error envelope",
+      "changed the JSON envelope mismatch message unexpectedly",
+    );
+    assert(
+      !error.message.includes(unexpectedBody),
+      "included the provider response body in the failure message",
+    );
+  },
+);
 
 Deno.test("asserts a consumed JSON response without recanceling its body", async () => {
   await assertJsonResponse(new Response('{"ok":true}'), {

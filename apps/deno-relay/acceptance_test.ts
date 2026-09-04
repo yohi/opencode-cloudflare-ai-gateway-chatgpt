@@ -4,6 +4,7 @@ import {
   anthropicInvalidJsonEnvelope,
   assertJsonResponse,
   assertSuccessfulResponse,
+  isGatewayAcceptanceConfigured,
   openAiAnyOfBody,
   openAiInvalidJsonEnvelope,
   readGatewayAcceptanceConfig,
@@ -21,6 +22,7 @@ function readAcceptanceOrigin(): string | undefined {
 }
 
 const origin = readAcceptanceOrigin();
+const gatewayAcceptanceConfigured = isGatewayAcceptanceConfigured();
 
 type ProtectedAcceptanceTest = (
   config: GatewayAcceptanceConfig,
@@ -32,11 +34,8 @@ function protectedAcceptanceTest(
 ): void {
   Deno.test({
     name,
-    ignore: origin === undefined,
+    ignore: !gatewayAcceptanceConfigured,
     fn: async () => {
-      if (origin === undefined) {
-        return;
-      }
       await test(readGatewayAcceptanceConfig());
     },
   });

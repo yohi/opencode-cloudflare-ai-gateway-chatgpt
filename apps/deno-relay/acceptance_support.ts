@@ -14,6 +14,14 @@ export type ExpectedJsonResponse = {
 
 export const acceptanceTimeoutMs = 30_000;
 
+const gatewayAcceptanceEnvironmentNames = [
+  "RELAY_ACCEPTANCE_GATEWAY_BASE_URL",
+  "RELAY_ACCEPTANCE_MODEL",
+  "RELAY_ACCEPTANCE_GATEWAY_TOKEN",
+  "RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY",
+  "RELAY_ACCEPTANCE_RELAY_SECRET",
+] as const;
+
 const safeRootAnyOf = {
   anyOf: [
     { type: "object", properties: { query: { type: "string" } } },
@@ -25,6 +33,23 @@ export const openAiInvalidJsonEnvelope =
   '{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}';
 export const anthropicInvalidJsonEnvelope =
   '{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}';
+
+function readEnvironmentValue(name: string): string | undefined {
+  try {
+    return Deno.env.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+export function isGatewayAcceptanceConfigured(
+  readValue: (name: string) => string | undefined = readEnvironmentValue,
+): boolean {
+  return gatewayAcceptanceEnvironmentNames.every((name) => {
+    const value = readValue(name);
+    return value !== undefined && value.trim().length > 0;
+  });
+}
 
 function requiredEnvironmentValue(name: string): string {
   const value = Deno.env.get(name);
@@ -118,7 +143,9 @@ export async function assertSuccessfulResponse(
 ): Promise<void> {
   try {
     if (response.status < 200 || response.status >= 300) {
-      throw new Error(`${label} expected a successful response`);
+      throw new Error(
+        `${label} expected a successful response, received ${response.status}`,
+      );
     }
   } finally {
     await response.body?.cancel();
@@ -131,7 +158,9 @@ export async function assertJsonResponse(
 ): Promise<void> {
   const body = await response.text();
   if (response.status !== expected.status) {
-    throw new Error(`${expected.label} returned an unexpected status`);
+    throw new Error(
+      `${expected.label} returned an unexpected status: expected ${expected.status}, received ${response.status}`,
+    );
   }
   if (body !== expected.body) {
     throw new Error(
