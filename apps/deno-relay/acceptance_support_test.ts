@@ -45,6 +45,7 @@ Deno.test(
               model: "acceptance-model",
               gatewayToken: "gateway-token",
               commandCodeApiKey: "command-code-key",
+              relaySecret: "relay-secret",
             },
             "/v1/models",
             { method: "GET" },

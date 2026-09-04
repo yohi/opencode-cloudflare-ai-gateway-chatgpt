@@ -51,6 +51,10 @@ Deno.test({
     }
     const response = await fetch(`${origin}/v1/responses`, {
       method: "GET",
+      headers: {
+        "X-ChatGPT-Relay-Authorization":
+          `Bearer ${readGatewayAcceptanceConfig().relaySecret}`,
+      },
       signal: AbortSignal.timeout(acceptanceTimeoutMs),
     });
     try {

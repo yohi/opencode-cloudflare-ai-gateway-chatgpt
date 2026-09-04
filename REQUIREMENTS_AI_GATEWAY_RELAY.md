@@ -326,9 +326,10 @@
     `RequestInit.redirect: "manual"` を指定し、relay 自身が upstream の redirect
     を自動取得しない。
   - 新規の `/upstream/*` 経路では、upstream の `304 Not Modified` は redirect
-    ではないため、サニタイズ後の response headers、status、body を pass-through
-    する。conditional request に使用される `If-None-Match` と
-    `If-Modified-Since` は denylist に含めず、upstream へ保持・転送する。
+    ではないため、サニタイズ後の response headers と status を pass-through
+    し、downstream body は空にする。conditional request に使用される
+    `If-None-Match` と `If-Modified-Since` は denylist に含めず、upstream
+    へ保持・転送する。
   - 新規の `/upstream/*` 経路では、`300`、`301`、`302`、`303`、`305`、`306`、
     `307`、`308` を含む `304` 以外のすべての 3xx（`Location` の絶対
     cross-origin、絶対 same-provider、相対 URL を含む）を `502` と
@@ -573,13 +574,16 @@ whitespace のみの場合は request-time に `503 Service unavailable`
   Custom Provider の protected header 設定だけに保存する。generic acceptance が
   relay 経由で成功することを `RELAY_SECRET` の存在確認とし、relay が `401`
   を返す場合は release gate を fail させる。
-- acceptance test の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
-  `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、`RELAY_ACCEPTANCE_MODEL`、
-  `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`
-  とする。 `RELAY_ACCEPTANCE_ORIGIN` は legacy relay の直接検証、Gateway base
-  URL は `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}` 形式の実
-  Custom Provider 経路に使用する。`RELAY_SECRET` は Custom Provider の protected
-  header 設定にのみ 保存し、test runner のログや request body に出力しない。
+  - acceptance test の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
+    `RELAY_ACCEPTANCE_RELAY_SECRET`、`RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、
+    `RELAY_ACCEPTANCE_MODEL`、
+    `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`
+    とする。 `RELAY_ACCEPTANCE_ORIGIN` は legacy relay の直接検証、Gateway base
+    URL は `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}` 形式の実
+    Custom Provider 経路に使用する。`RELAY_SECRET` は Custom Provider の
+    protected header 設定にのみ保存し、legacy direct acceptance では protected
+    secret から認証 ヘッダーへだけ注入する。test runner のログや request body
+    に出力しない。
 
 ---
 

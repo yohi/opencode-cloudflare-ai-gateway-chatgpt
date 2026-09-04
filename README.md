@@ -113,6 +113,7 @@ https://chatgpt.com/backend-api/codex/responses
 - `x-forwarded-*`
 - `forwarded`
 - `x-real-ip`
+- `X-Relay-Authorization`
 - `X-ChatGPT-Relay-Authorization`
 - `host`
 - `content-length`
@@ -165,8 +166,8 @@ JSON parse を行わず body を raw forward します。その route を provid
 既存の `/v1/responses` はこの解析を行いません。
 
 汎用経路の upstream `401`、`403`、`429`、`5xx` および通常の response は pass-through
-します。upstream の `304 Not Modified` も redirect ではないため、status、サニタイズ後の
-headers、body を pass-through します。`If-None-Match` と `If-Modified-Since` は denylist
+します。upstream の `304 Not Modified` も redirect ではないため、status とサニタイズ後の
+response headers を pass-through し、downstream body は空にします。`If-None-Match` と `If-Modified-Since` は denylist
 に含めず、upstream へ保持・転送します。`304` 以外の `3xx`（`300`、`301`、`302`、`303`、
 `305`、`306`、`307`、`308`）は、absolute cross-origin、absolute same-provider、relative
 な `Location` を問わず `502 {"error":"upstream_redirect_not_allowed"}` に変換し、

@@ -150,7 +150,7 @@ apps/deno-relay/
 - upstream 応答ヘッダーのサニタイズ
 - upstream fetch では必ず `redirect: "manual"` を指定する（`/v1/responses` と `/upstream/*` 共通）。
 - `/upstream/*` では upstream の `304 Not Modified` を redirect とみなさず、
-  サニタイズ後の response headers、status、body を pass-through する。
+  サニタイズ後の response headers と status を pass-through し、downstream body は空にする。
   `If-None-Match` と `If-Modified-Since` は denylist に含めず、upstream へ保持・転送する。
 - `/upstream/*` では `300`、`301`、`302`、`303`、`305`、`306`、`307`、`308` を含む
   `304` 以外のすべての 3xx を追加 fetch せず、`502` と
@@ -196,8 +196,10 @@ apps/deno-relay/
   `request.signal` と固定の `NORMALIZATION_BODY_TIMEOUT_MS = 30_000`（30 秒）を reader の読み取りへ
   伝播する。client abort または body timeout では reader を cancel し、upstream fetch 前に slot を
   解放して終了する。既知の `Content-Length` による早期 `413` でも inbound reader を cancel する。
-  parse failure、413、body timeout、client abort、upstream fetch error、response completion の全経路で
-  slot を一度だけ解放する。
+  parse failure、413、body timeout、client abort、upstream fetch error の全経路で slot を一度だけ解放する。
+  正常系では counted reader と patch assembly が完了し、upstream request body が不要になった時点で
+  解放する。upstream response の streaming concurrency を制限する場合は、normalization slot とは
+  別の counter を使用する。
 
 route pathname を API request shape の主な識別子とし、対象 schema member は次のように
 固定する。
@@ -358,7 +360,7 @@ schema の意味を維持するため `tools[].input_schema` の root `anyOf` �
 | normalization body timeout | `408` | `{"error":"request_body_timeout"}` | 固定 30 秒。reader を cancel し、upstream fetch 前に返す |
 | 認識済み route の JSON member 重複 | `400` | route-specific provider-compatible error envelope | `duplicate_json_member` として normalization/upstream fetch 前に返す |
 | envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
-| generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers/body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
+| generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers、空 body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
 | generic `/upstream/*` の upstream `304` 以外の 3xx（`300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`） | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
@@ -510,7 +512,7 @@ route/request shape を混同しない別ケースとして扱う。
   skip、upstream fetch call count `0` となること
 - body buffering 前の normalization slot 上限 `16` を超えた場合、reader を消費せず
   `503 {"error":"normalization_capacity_exhausted"}` を返すこと。parse failure、413、body
-  timeout、client abort、upstream error、response completion の各経路で slot が一度だけ解放され、
+  timeout、client abort、upstream error、body assembly 完了の各経路で slot が一度だけ解放され、
   後続 request が再利用できること
 - `Content-Length` が上限以下でも実 body が超過する場合、超過 chunk で reader を cancel し、
   upstream fetch call count が `0` となること。固定 30 秒の slow body timeout と
@@ -531,7 +533,7 @@ route/request shape を混同しない別ケースとして扱う。
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - generic `/upstream/*` の upstream mock が `300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`（`Location` と body 付き）を返した場合に、`502` / `{"error":"upstream_redirect_not_allowed"}` へ変換し、`Location`、upstream headers、body を返さず、追加 fetch を行わないこと（各 status の upstream fetch call count は 1）
-- generic `GET /upstream/command-code/v1/models` が `If-None-Match` または `If-Modified-Since` を upstream へ転送し、upstream mock の `304 Not Modified` の status、サニタイズ後の headers、body を downstream へ pass-through すること（upstream fetch call count は 1）
+- generic `GET /upstream/command-code/v1/models` が `If-None-Match` または `If-Modified-Since` を upstream へ転送し、upstream mock の `304 Not Modified` の status、サニタイズ後の headers、空 body を downstream へ pass-through すること（upstream fetch call count は 1）
 - generic `/upstream/*` で absolute cross-origin、absolute same-provider、relative の各 `Location` を拒否し、クライアントが Gateway 外へ follow できる `Location` を downstream に返さないこと
 - generic `/upstream/*` の 307 POST で、元の body が最初の upstream request に一度だけ届き、redirect 先への二度目の request や認証 header の別 origin 送信がないこと
 - legacy `/v1/responses` の upstream mock が 302 / 307 を返した場合に、既存互換どおり status・サニタイズ後の `Location` を含む headers・body を pass-through すること
@@ -621,17 +623,18 @@ route/request shape を混同しない別ケースとして扱う。
   その serialization と secret forwarding を説明していないため、設定が実際に
   機能することを acceptance の必須条件とする。
 - Gateway base URL、Gateway token、Command Code API key は protected Environment の
-  variables/secrets から注入し、workflow のログへ出力しない。`RELAY_SECRET` は test
-  runner に注入せず、Cloudflare Custom Provider の protected header 設定だけに保存する。
-  generic acceptance が relay 経由で成功することを `RELAY_SECRET` の存在確認とし、relay
-  が `401` を返す場合は release gate を fail させる。必須値が欠落した場合は skip しない。
-- test runner の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
+  variables/secrets から注入し、workflow のログへ出力しない。`RELAY_SECRET` は Cloudflare
+  Custom Provider の protected header 設定に保存し、legacy direct acceptance 用にだけ
+  `RELAY_ACCEPTANCE_RELAY_SECRET` として protected secret から認証ヘッダーへ注入する。
+  generic acceptance が relay 経由で成功することも `RELAY_SECRET` の存在確認とし、relay が
+  `401` を返す場合は release gate を fail させる。必須値が欠落した場合は skip しない。
+- test runner の必須値は `RELAY_ACCEPTANCE_ORIGIN`、`RELAY_ACCEPTANCE_RELAY_SECRET`、
   `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、`RELAY_ACCEPTANCE_MODEL`、
   `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY` とする。
   `RELAY_ACCEPTANCE_ORIGIN` は legacy relay の直接検証、Gateway base URL は
   `https://gateway.ai.cloudflare.com/v1/{account}/{gateway}` 形式の実 Custom Provider
-  経路に使用する。`RELAY_SECRET` は Custom Provider の protected header 設定にのみ
-  保存し、test runner のログや request body に出力しない。
+  経路に使用する。`RELAY_ACCEPTANCE_RELAY_SECRET` は legacy direct acceptance の
+  認証ヘッダーにだけ使用し、test runner のログや request body に出力しない。
 
 ## 10. Future 拡張（Roadmap）
 

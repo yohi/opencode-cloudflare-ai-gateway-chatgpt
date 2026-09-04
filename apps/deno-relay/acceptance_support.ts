@@ -3,6 +3,7 @@ export type GatewayAcceptanceConfig = {
   readonly model: string;
   readonly gatewayToken: string;
   readonly commandCodeApiKey: string;
+  readonly relaySecret: string;
 };
 
 export type ExpectedJsonResponse = {
@@ -43,6 +44,7 @@ export function readGatewayAcceptanceConfig(): GatewayAcceptanceConfig {
     commandCodeApiKey: requiredEnvironmentValue(
       "RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY",
     ),
+    relaySecret: requiredEnvironmentValue("RELAY_ACCEPTANCE_RELAY_SECRET"),
   };
 }
 

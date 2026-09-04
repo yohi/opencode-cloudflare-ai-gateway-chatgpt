@@ -66,7 +66,7 @@
 - Modify: `README.md`
 
 **Interfaces:**
-- Consumes: Protected environment values `RELAY_ACCEPTANCE_ORIGIN`, `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`, `RELAY_ACCEPTANCE_MODEL`, `RELAY_ACCEPTANCE_GATEWAY_TOKEN`, and `RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`.
+- Consumes: Protected environment values `RELAY_ACCEPTANCE_ORIGIN`, `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`, `RELAY_ACCEPTANCE_MODEL`, `RELAY_ACCEPTANCE_GATEWAY_TOKEN`, `RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`, and protected secret `RELAY_ACCEPTANCE_RELAY_SECRET` for the authenticated legacy direct probe.
 - Produces: Real Gateway-to-provider checks using `cf-aig-authorization`, provider `Authorization`, and the configured Custom Provider relay header.
 
 - [x] **Step 1: Write the concrete acceptance fixtures**
@@ -85,7 +85,7 @@
 
 - [x] **Step 3: Make missing configuration fail in the protected workflow**
 
-  Expose the three variables and two secrets through the `protected-acceptance` job, validate their presence without printing values, remove the current skip step, and run the acceptance test unconditionally after validation. Local `deno test apps/deno-relay` may continue to ignore network acceptance when `RELAY_ACCEPTANCE_ORIGIN` is absent.
+Expose the three variables and three secrets through the `protected-acceptance` job, validate their presence without printing values, remove the current skip step, and run the acceptance test unconditionally after validation. Local `deno test apps/deno-relay` may continue to ignore network acceptance when `RELAY_ACCEPTANCE_ORIGIN` is absent.
 
 ### Task 3: Verify and publish the fixes
 
