@@ -87,7 +87,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、body パース、スキーマ正規化、upstream URL 構築 |
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、body パース、スキーマ正規化、upstream URL 構築。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理 |
 | `schema.ts` | `tools[].function.parameters` の正規化実装 |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
@@ -118,7 +118,7 @@ apps/deno-relay/
 | 経路 | 許可される認証ヘッダー | 備考 |
 |---|---|---|
 | `/v1/responses` | `X-ChatGPT-Relay-Authorization: Bearer <RELAY_SECRET>` | 既存後方互換 |
-| `/upstream/*` | `Authorization: Bearer <RELAY_SECRET>` または `X-Relay-Authorization: Bearer <RELAY_SECRET>` | 汎用 |
+| `/upstream/*` | `X-Relay-Authorization: Bearer <RELAY_SECRET>` | 汎用。標準 `Authorization` は upstream provider credential として転送される |
 
 - `RELAY_SECRET` が未設定/空 → `503 Service unavailable`（テキストボディ `Service unavailable`）
 - 認証ヘッダー欠落/不一致 → `401 { "error": "unauthorized" }`
@@ -131,8 +131,9 @@ apps/deno-relay/
 - リクエストヘッダーのサニタイズ
   - Hop-by-hop ヘッダー除去（`connection`, `transfer-encoding`, `content-length` 等）
   - Cloudflare 内部ヘッダー除去（`cf-*`, `cf-aig-*`, `x-forwarded-*`）
-  - リレー認証ヘッダー除去
+  - リレー認証ヘッダー除去（`X-Relay-Authorization`、`X-ChatGPT-Relay-Authorization`）
   - `Connection` ヘッダーに列挙されたヘッダー除去
+  - 標準 `Authorization` ヘッダーは upstream provider credential として保持・転送する
 - upstream 応答ヘッダーのサニタイズ
 - SSE 応答の場合、120 秒のアイドルタイムアウトを適用
 - クライアント切断時に upstream fetch および response body を abort
@@ -150,12 +151,13 @@ apps/deno-relay/
 
 各 `tools[].function.parameters` に対し、以下を適用する。
 
-1. **`anyOf` の解消**
-   - `parameters.anyOf` が存在し、要素がオブジェクトの場合：
-     - 各要素の `properties` をルート直下の `properties` にマージする
-     - 同名 key が衝突した場合、後勝ち（配列後方の要素が優先）
-     - 処理後、`anyOf` キーを削除する
-   - `anyOf` 要素がオブジェクトでない場合は無視する
+1. **`anyOf` の条件付き解消**
+   - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+     1. すべての branch が `type: "object"` を持つこと。
+     2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
+     3. 異なる branch 間で同名の property key が存在しないこと。
+     4. 各 branch の property の型・制約が互換であること。
+   - 上記条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
 
 2. **`type: "object"` の保証**
    - `parameters.type` が未定義、空文字、または空オブジェクト `{}` の場合：
@@ -168,8 +170,9 @@ apps/deno-relay/
    - 既存の `properties` は保持する
 
 4. **その他フィールド**
-   - `required`, `description`, `additionalProperties` 等はそのまま保持する
-   - `messages` 等、`tools` 以外のフィールドには一切触れない
+   - `description` 等、`tools` 以外のフィールドには一切触れない。
+   - `messages` 等、巨大なフィールドには一切触れない。
+   - `required`、`additionalProperties` は、正規化前の値を保持する（anyOf flatten 適用外の場合）。
 
 ### 5.3 正規化例
 
@@ -216,6 +219,8 @@ apps/deno-relay/
 }
 ```
 
+上記はあくまで「安全に flatten できる `anyOf`」の例である。実際の実装では 5.2 の条件を厳密に検証し、条件を満たさない `anyOf` は変換せずそのまま残す。
+
 ## 6. エラーハンドリング
 
 | 状況 | ステータス | ボディ | 備考 |
@@ -240,9 +245,11 @@ apps/deno-relay/
 
 ### 7.2 プリセットプロバイダ
 
-| provider-slug | upstream base URL |
-|---|---|
-| `command-code` | `https://api.commandcode.ai/provider/v1/` |
+| provider-slug | upstream base URL | クライアントからの path suffix 例 |
+|---|---|---|
+| `command-code` | `https://api.commandcode.ai/provider/v1/` | `/chat/completions`, `/messages`, `/models` |
+
+upstream URL は `base URL + path suffix` で構築する。`command-code` の base URL は `/provider/v1/` で終わるため、relay route の `/upstream/command-code/` 以降には `/v1` を含めず、例えば `/chat/completions` を付加して `https://api.commandcode.ai/provider/v1/chat/completions` とする。
 
 未知の `provider-slug` へのリクエストは `404 Not Found` を返す。
 
@@ -262,22 +269,36 @@ apps/deno-relay/
 
 以下をカバーする単体テストを作成する。
 
-- `anyOf` のマージ
+- 安全な `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし）
+- `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
+- 同名 property が異なる type を持つ場合は変換しない
+- `additionalProperties: false` を含む場合は変換しない
+- `enum` / `const` 等の制約を含む場合は変換しない
+- 条件を満たさない `anyOf` を持つスキーマが、silent semantic corruption なく無改変で通過すること
 - `type` の補完（未定義 / 空 / 空オブジェクト）
 - 空 `properties` の補完
 - 引数なしツールの正規化
 - 既存の正しいスキーマは無改変
 - `messages` や他フィールドが残ること
-- `anyOf` 要素がオブジェクトでない場合の無視
+- `anyOf` 要素がオブジェクトでない場合は無改変
 - 空 `tools` 配列の場合の無改変
 
 ### 9.2 relay_test.ts（既存を拡張）
 
 以下を追加する統合テストを作成する。
 
-- `/upstream/command-code/v1/chat/completions` への転送と upstream URL 検証
+- `/upstream/command-code/chat/completions` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/chat/completions` 完全一致）
+- `/upstream/command-code/messages` への転送と upstream URL 検証
+- `/upstream/command-code/models` への転送と upstream URL 検証
+- query string の保持
+- `/provider/v1/v1/...` が生成されない回帰テスト
 - 未知 provider slug での `404`
-- `Authorization` / `X-Relay-Authorization` 認証
+- `X-Relay-Authorization` 認証成功
+- `Authorization: Bearer <CMD_API_KEY>` と `X-Relay-Authorization: Bearer <RELAY_SECRET>` が同時に存在すると認証成功
+- upstream mock には `Authorization` の `<CMD_API_KEY>` がそのまま届く
+- `X-Relay-Authorization` は upstream に届かない
+- relay secret 不正/欠落時は upstream fetch 前に `401`
+- `RELAY_SECRET` が `Authorization` として upstream へ漏れない
 - リクエストボディの tools 正規化が upstream で確認できること
 - 既存 `/v1/responses` テストの維持
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
@@ -317,4 +338,5 @@ apps/deno-relay/
 5. 既存の `deno test apps/deno-relay` / `deno lint` / `deno fmt --check` がすべて通ることを確認
 6. Deno Deploy 側で `RELAY_SECRET` を設定済みであることを確認
 7. Cloudflare AI Gateway の `command-code` Custom Provider の `base_url` を `https://<relay-domain>.deno.dev/upstream/command-code/` に変更
-8. 既存 `chatgpt-codex-deno` provider は `base_url` を変更せず継続利用
+8. Cloudflare AI Gateway の `command-code` Custom Provider において、リレー認証用ヘッダーとして `X-Relay-Authorization: Bearer <RELAY_SECRET>` を設定する。標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。
+9. 既存 `chatgpt-codex-deno` provider は `base_url` を変更せず継続利用

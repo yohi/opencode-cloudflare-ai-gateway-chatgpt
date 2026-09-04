@@ -74,8 +74,13 @@
 ### 3.2 リクエストサニタイズ機能（スキーマ正規化パイプライン）
 - **Tool Schema Normalization（ツール定義の正規化）**:
   - 対象: `application/json` かつ `body.tools` が配列の場合。
-  - **`anyOf` の解消**:
-    - `parameters.anyOf` が存在する場合、含まれる各オブジェクトの `properties` をルート直下にマージし、`anyOf` キーを安全に削除する。
+  - **`anyOf` の条件付き解消**:
+    - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+      1. すべての branch が `type: "object"` を持つこと。
+      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
+      3. 異なる branch 間で同名の property key が存在しないこと。
+      4. 各 branch の property の型・制約が互換であること。
+    - 上記条件を満たさない `anyOf` は、そのまま残すか、非対応として変換前のリクエストを拒否する。後勝ちマージによる silent semantic corruption は許容しない。
   - **`type: "object"` の強制保証**:
     - `parameters.type` が未定義、あるいは空オブジェクト `{}` の場合、必ず `"type": "object"` を付与する。
   - **空 properties の健全化**:
@@ -85,12 +90,13 @@
 
 ### 3.3 認証・セキュリティ機能
 - **リレー共通認証トークン**:
-  - Gateway から送信される Bearer トークン（例: `Authorization: Bearer <RELAY_SECRET>` または `X-Relay-Authorization`）を検証する。
+  - Gateway から送信される Bearer トークンは `X-Relay-Authorization: Bearer <RELAY_SECRET>` の形式で検証する。`/upstream/*` では標準 `Authorization` ヘッダーはリレー認証には使用しない。
   - ChatGPT 経路の後方互換ヘッダー（`X-ChatGPT-Relay-Authorization`）も同時にサポートする。
 - **ヘッダーサニタイズ**:
   - Hop-by-hop ヘッダー（`connection`, `transfer-encoding` 等）を除去。
   - Cloudflare 内部ヘッダー（`cf-*`, `cf-aig-*`, `x-forwarded-*`）を上流へ流さないよう除去。
-  - リレー認証ヘッダーを上流へ漏洩させない。
+  - リレー認証ヘッダー（`X-Relay-Authorization`、`X-ChatGPT-Relay-Authorization`）を上流へ漏洩させない。
+  - 標準 `Authorization` ヘッダーは上流プロバイダーの認証情報として保持・転送する。
 
 ### 3.4 レスポンスストリーミング（SSE）中継
 - **完全透過ストリーミング**:
@@ -137,7 +143,8 @@
 - **既存の Base URL**: `https://api.commandcode.ai/provider/v1/`
 - **移行後の Base URL**: `https://<relay-domain>.deno.dev/upstream/command-code/`
 - **設定ヘッダー**:
-  - `Authorization: Bearer <RELAY_SECRET>` (または `X-Relay-Authorization`)
+  - `X-Relay-Authorization: Bearer <RELAY_SECRET>`
+  - 標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。
 
 ---
 
