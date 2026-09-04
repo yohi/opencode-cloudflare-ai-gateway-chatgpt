@@ -60,7 +60,7 @@
 │  [2. ルーティング解決 (Path-based / Target-based)]           │
 │        │                                                    │
 │  [3. リクエストサニタイズ・パイプライン]                       │
-│        ├─ Tool Schema Normalization (anyOf → properties 互換変換) │
+│        ├─ Tool Schema Normalization (OpenAI / Anthropic)            │
 │        ├─ Type: "object" 保証 / 空パラメータ補正            │
 │        └─ プロバイダ別特殊パラメータ変換                     │
 │        │                                                    │
@@ -122,6 +122,19 @@
   - 対象: `Content-Type` を HTTP media type として解釈した type/subtype が
     `application/json`（パラメータ付き表記および type/subtype
     の大文字小文字違いを含む）かつ `body.tools` が配列の場合。
+  - **リクエスト形状の識別**:
+    - `POST /upstream/<provider-slug>/v1/chat/completions` では、`tools[]`
+      の要素が `type: "function"`、`function` オブジェクト、およびその
+      `parameters` スキーマ
+      オブジェクトを持つ場合に限り、`tools[].function.parameters` を正規化する。
+    - `POST /upstream/<provider-slug>/v1/messages` では、Anthropic Messages API
+      の client tool 形状（`name` と `input_schema`
+      オブジェクト）を持つ要素に限り、 `tools[].input_schema`
+      を正規化する。`input_schema` を持たない server tool 要素は変更しない。
+    - URL pathname を API 形状の主な識別子とし、OpenAI 経路で `input_schema`
+      を、Anthropic 経路で `function.parameters` を検出しただけでは
+      変換しない。上記以外の route、method、または形状不一致の body は、JSON
+      parse failure の規約を除き、スキーマ正規化を行わない。
   - **JSON body parse failure**:
     - `/upstream/*` の POST かつ media type が `application/json` の場合、body
       の JSON パースに失敗したら、upstream fetch の前に status `400`、body
@@ -133,15 +146,16 @@
     - 汎用経路は、リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify`
       で再構築してはならない。これにより、正規化対象外のフィールドや数値リテラルが暗黙に変更されることを防ぐ。
     - 正規化は各 JSON token の元の body byte span を保持する
-      raw/token-preserving 表現を使い、対象となる `tools[].function.parameters`
-      の変更対象 span だけを置換する。それ以外の body bytes と JSON
-      token（number を含む）は保持する。
+      raw/token-preserving 表現を使い、対象となる schema の変更対象 span
+      だけを置換する。 それ以外の body bytes と JSON token（number
+      を含む）は保持する。対象 schema は `tools[].function.parameters` または
+      `tools[].input_schema` とする。
     - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000`
       形式を含む）、および nesting を追跡し、文字列中の
       `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path
-      として誤認してはならない。`tools`、`function`、`parameters` の member path
-      は JSON string escape を解釈して判定するが、元の key token bytes
-      は変更しない。
+      として誤認してはならない。`tools`、`function`、`parameters`、`input_schema`
+      の member path は JSON string escape を解釈して判定するが、元の key token
+      bytes は変更しない。
     - body の位置情報は元の UTF-8 body bytes に対する byte offset
       とし、JavaScript の UTF-16 code-unit index
       と混同してはならない。複数の置換 span は元の body
@@ -155,14 +169,15 @@
       へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの
       silent data corruption は許容しない。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
-    - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各
-      branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+    - 対象 schema の `anyOf`
+      が存在する場合、以下の条件をすべて満たすときのみ、各 branch の
+      `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
       2. 各 branch が `properties`
          以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
       3. 異なる branch 間で同名の property key が存在しないこと。
       4. 各 branch の property の型・制約が互換であること。
-      5. `parameters` ルートに、branch の評価と相互作用する object
+      5. 対象 schema ルートに、branch の評価と相互作用する object
          制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties`
          等）が存在しないこと。
     - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により
@@ -176,16 +191,17 @@
       silent semantic corruption は許容しない。特に root と branch の object
       制約を含むスキーマは、変換前後で評価範囲が変わり得るため flatten しない。
   - **`type: "object"` の強制保証**:
-    - `parameters.type` が未定義、あるいは空オブジェクト `{}` の場合、必ず
-      `"type": "object"` を付与する。
+    - 各対象 schema が空オブジェクト、または `type` member が未定義/空文字列の
+      場合、必ず `"type": "object"` を付与する。それ以外の既存 `type`
+      は変更しない。
   - **空 properties の健全化**:
-    - 引数のないツールのパラメータ定義であっても、`"properties": {}`
-      を保持させて厳格バリデータを通過させる。
+    - 引数のないツールのパラメータ定義であっても、各対象 schema に
+      `"properties": {}` を保持させて厳格バリデータを通過させる。
 - **メッセージ / 引数の破損防止**:
   - `tools` 以外の巨大なフィールド（`messages`
     等）は一切改変せず、raw/token-preserving な body のまま転送する。
-  - `tools[].function.parameters` でも正規化対象外のフィールドと JSON 数値 token
-    は一切改変しない。
+  - `tools[].function.parameters` および `tools[].input_schema`
+    でも、正規化対象外の フィールドと JSON 数値 token は一切改変しない。
 
 ### 3.3 認証・セキュリティ機能
 
@@ -205,9 +221,20 @@
     ヘッダーは上流プロバイダーの認証情報として保持・転送する。
 - **リダイレクト制御**:
   - `/v1/responses` と `/upstream/*` の共通 upstream fetch は
-    `RequestInit.redirect: "manual"` を指定し、upstream の 3xx を `Location`
-    に従って自動取得しない。3xx の status、サニタイズ後の response
-    headers（`Location` を含む）、body は relay response として透過する。
+    `RequestInit.redirect: "manual"` を指定し、relay 自身が upstream の redirect
+    を自動取得しない。
+  - 新規の `/upstream/*` 経路では、upstream のすべての 3xx（`Location` の絶対
+    cross-origin、絶対 same-provider、相対 URL を含む）を `502` と
+    `{"error":"upstream_redirect_not_allowed"}` に変換する。upstream の status、
+    response headers（`Location` を含む）、body は downstream へ返さず、追加
+    fetch も行わない。これによりクライアントの redirect follow による
+    Gateway/relay 経路外への誘導を防ぐ。`307` / `308` の場合も、元の POST body
+    は最初の upstream request に 1 回だけ送られ、relay が別 URL へ再送しない。
+  - 既存 `/v1/responses` は後方互換のため、従来どおり 3xx の
+    status、サニタイズ後の response headers（`Location` を含む）、body を
+    pass-through する。この経路でも relay 自身は追加 fetch
+    を行わないが、これは固定 ChatGPT upstream に対する明示的な legacy
+    compatibility exception であり、汎用経路へ適用してはならない。
 
 ### 3.4 レスポンスストリーミング（SSE）中継
 
@@ -275,6 +302,24 @@
 | `UPSTREAM_HEADER_TIMEOUT_MS` |  -   | 上流初期応答タイムアウト（既定: 30000）      |
 | `SSE_IDLE_TIMEOUT_MS`        |  -   | SSE アイドルタイムアウト（既定: 120000）     |
 
+timeout 設定は startup 時に共通の config loader
+で検証する。未設定（`undefined`）は
+それぞれの既定値を使用し、空文字列は未設定とはみなさず不正値とする。値は前後の
+ASCII whitespace を除去した後、`[1-9][0-9]*` に一致する 1 以上の整数
+milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
+以下とする。`0`、負数、符号付き表記、小数、`30s`
+等の非数値、`NaN`、`Infinity`、および上限超過値はすべて設定
+エラーとする。設定エラー時は default への silent fallback や
+`Number(...) || ...` を行わず、`Deno.serve` を開始しない fail-closed
+起動失敗とする。エラー診断には
+変数名と理由だけを含め、secret、credential、request body は含めない。
+
+`main.ts` はこの loader の結果を `upstreamHeaderTimeoutMs` と `sseIdleTimeoutMs`
+として handler に明示的に dependency injection する。handler の timeout 処理は
+受け取った milliseconds をそのまま使用し、production の env 値が header timeout
+と SSE idle timeout の各処理へ到達することを検証可能にする。`RELAY_SECRET`
+が未設定の場合の既存の `503` 契約は変更しない。
+
 ### 5.2 Cloudflare AI Gateway 側の Custom Provider 設定変更
 
 - **プロバイダ名**: `command-code`
@@ -295,6 +340,25 @@
     `/upstream/command-code/v1/messages` を到達させる。
   - models list は両 SDK とも `/v1/models` を使用し、relay から upstream の
     `https://api.commandcode.ai/provider/v1/models` へ転送する。
+
+### 5.3 テスト要件
+
+- schema normalization は OpenAI の `tools[].function.parameters` と Anthropic
+  の `tools[].input_schema` を別の route/request shape として検証する。
+- `/upstream/<slug>/v1/messages` の `input_schema.anyOf`、`type` / `properties`
+  欠落、 既に有効な schema の無変更、`messages` 内や別フィールドの無関係な
+  schema の無変更を 検証する。OpenAI route では `function.parameters`、Anthropic
+  route では `input_schema` のみが対象となることも検証する。
+- generic `/upstream/*` の absolute cross-origin、absolute
+  same-provider、relative `Location` を含む 302 / 307 response は、`502`
+  の安定したエラーとなり、`Location` が downstream に返らず、追加 fetch や認証
+  header の別 origin 送信がないことを検証する。 307 の最初の POST body
+  は一度だけ upstream に届くことを検証する。
+- legacy `/v1/responses` は既存の redirect pass-through
+  契約を維持することを別テストで 検証する。
+- config loader は env 未設定、正の整数
+  override、`0`、負数、非数値、空文字列、上限超過値を 検証し、valid override が
+  header timeout と SSE idle timeout の実処理へ伝播することを 検証する。
 
 ---
 

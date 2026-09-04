@@ -10,8 +10,8 @@ Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブと�
 
 本設計は、既存の Deno Deploy リレーを **汎用 AI Gateway リレー** に拡張し、次の目的を達成することを目指す。
 
-1. 複数プロバイダ（OpenAI 互換 API）へのマルチアップストリーム転送
-2. `tools[].function.parameters` のスキーマ正規化
+1. 複数プロバイダ API（OpenAI 互換および Anthropic Messages 形状）へのマルチアップストリーム転送
+2. OpenAI の `tools[].function.parameters` と Anthropic Messages の `tools[].input_schema` のスキーマ正規化
 3. Cloudflare Workers Free の CPU 制限の影響を受ける処理を Deno Deploy relay へ分離
 4. 既存 ChatGPT Codex 経路の後方互換維持
 
@@ -19,7 +19,9 @@ Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブと�
 
 - **ゼロ外部依存**: Deno 標準 API のみで実装する
 - **ステートレス**: リレー自身は永続状態を持たない
-- **最小限の介入**: raw/token-preserving な body のうち `tools[].function.parameters` の対象キーのみを正規化し、`messages` 等の大容量フィールドと正規化対象外の JSON token は一切改変しない
+- **最小限の介入**: raw/token-preserving な body のうち、route に対応する
+  `tools[].function.parameters` または `tools[].input_schema` の対象キーのみを正規化し、
+  `messages` 等の大容量フィールドと正規化対象外の JSON token は一切改変しない
 - **後方互換**: 既存 `POST /v1/responses` 経路を維持する
 - **責務分離**: HTTP 転送、ルーティング、スキーマ変換、各経路ハンドラを分離する
 
@@ -52,7 +54,7 @@ Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブと�
 │        └─ /upstream/*: X-Relay-Authorization               │
 │        │                                                    │
 │  [3. リクエストサニタイズ（汎用経路のみ）]                      │
-│        └─ tools[].function.parameters の正規化              │
+│        └─ OpenAI / Anthropic tools schema の正規化          │
 │        │                                                    │
 │  [4. upstream 転送 & SSE アイドルタイムアウト制御]             │
 └──────────────┬──────────────────────────────┬───────────────┘
@@ -73,10 +75,12 @@ apps/deno-relay/
 ├── chatgpt.ts           # POST /v1/responses → chatgpt.com 固定転送
 ├── upstream.ts          # /upstream/<provider-slug>/* → 対応 upstream 転送
 ├── forward.ts           # 共通の upstream fetch + SSE 転送ロジック
-├── schema.ts            # tools スキーマ正規化
+├── schema.ts            # OpenAI / Anthropic tools スキーマ正規化
+├── config.ts             # 環境変数の timeout parsing と設定値
 ├── types.ts             # 共有型
 ├── relay_test.ts        # 既存後方互換 + 統合テスト
 ├── schema_test.ts       # 正規化単体テスト
+├── config_test.ts       # 環境変数設定単体テスト
 └── deno.json            # 変更なし
 ```
 
@@ -84,12 +88,13 @@ apps/deno-relay/
 
 | コンポーネント | 責務 |
 |---|---|
-| `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
+| `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取り、`config.ts` の検証済み timeout を依存注入 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
-| `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にし、upstream の 3xx を追従せず透過する |
-| `schema.ts` | `tools[].function.parameters` の正規化実装 |
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
+| `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。3xx の response policy は route ごとに分け、generic route は拒否、legacy route は互換 pass-through とする |
+| `schema.ts` | route に対応する `tools[].function.parameters` または `tools[].input_schema` の正規化実装 |
+| `config.ts` | `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` を既定値・範囲付き整数 milliseconds として parse し、不正値で fail-closed にする |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
 
 ## 4. リクエスト処理フロー
@@ -114,9 +119,9 @@ apps/deno-relay/
                              ├─ HTTP method をそのまま forward
                              ├─ POST + application/json の場合のみ lossless token scan/transform
                              ├─ JSON parse 失敗 → 400 `{"error":"invalid_json_body"}`（upstream fetch 前）
-                             ├─ schema.ts で tools 正規化
+                             ├─ route に対応する tools schema を schema.ts で正規化
                              ├─ containment 検証済みの upstream URL と query を forward
-                             └─ forward.ts で `redirect: "manual"` を指定して転送
+                             └─ forward.ts で `redirect: "manual"` を指定し、generic の 3xx を拒否
 ```
 
 ### 4.2 認証
@@ -143,7 +148,15 @@ apps/deno-relay/
 - upstream URL の containment 検証が完了するまで provider credential を転送しない
 - upstream 応答ヘッダーのサニタイズ
 - upstream fetch では必ず `redirect: "manual"` を指定する（`/v1/responses` と `/upstream/*` 共通）。
-- upstream の 302、307 等は追加 fetch せず、status、サニタイズ後の response headers（`Location` を含む）、body をそのまま relay response へ透過する。
+- `/upstream/*` では upstream のすべての 3xx を追加 fetch せず、`502` と
+  `{"error":"upstream_redirect_not_allowed"}` に変換する。upstream の status、response
+  headers（`Location` を含む）、body は downstream へ返さない。
+- `/v1/responses` では既存互換のため、3xx の status、サニタイズ後の response headers
+  （`Location` を含む）、body を pass-through する。relay 自身は追加 fetch を行わないが、
+  この legacy exception を generic route に適用してはならない。
+- generic route の `Location` が absolute cross-origin、absolute same-provider、relative
+  のいずれであっても拒否する。`307` / `308` でも、元の POST body は最初の upstream
+  request に 1 回だけ送られ、relay は redirect 先へ再送しない。
 - SSE 応答の場合、120 秒のアイドルタイムアウトを適用
 - クライアント切断時に upstream fetch および response body を abort
 
@@ -157,34 +170,48 @@ apps/deno-relay/
 - `body.tools` が配列であること
 - 全体の `JSON.parse` → `JSON.stringify` ではなく、raw/token-preserving な変換を適用できること
 
+route pathname を API request shape の主な識別子とし、対象 schema member は次のように
+固定する。
+
+| route pathname | 認識する tool shape | 正規化対象 |
+|---|---|---|
+| `/upstream/<provider-slug>/v1/chat/completions` | OpenAI の `type: "function"`、`function` オブジェクト、`parameters` schema object | `tools[].function.parameters` |
+| `/upstream/<provider-slug>/v1/messages` | Anthropic Messages の client tool shape（`name` と `input_schema` object） | `tools[].input_schema` |
+
+OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を検出した
+だけでは変換しない。`input_schema` を持たない Anthropic server tool、上記以外の
+route/method、および shape 不一致の `tools[]` 要素も変更しない。JSON body の parse
+failure だけは 4.1 の汎用経路規約に従う。
+
 ### 5.2 正規化ルール
 
-各 `tools[].function.parameters` に対し、以下を適用する。
+各 route の対象 schema（`tools[].function.parameters` または
+`tools[].input_schema`）に対し、以下を適用する。
 
 - **JSON body の表現と数値保持**
-  - リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify` で再構築してはならない。各 JSON token の元の body byte span を保持する raw/token-preserving な表現で、対象となる `tools[].function.parameters` の変更対象 span だけを置換する。
+  - リクエスト全体を ECMAScript の `JSON.parse` → `JSON.stringify` で再構築してはならない。各 JSON token の元の body byte span を保持する raw/token-preserving な表現で、対象となる schema の変更対象 span だけを置換する。
   - `tools` 以外のフィールド、正規化対象外のフィールド、およびそれらの JSON token（number を含む）は元の body bytes のまま保持する。
   - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現としてコピーする。`9007199254740993` と `9223372036854775807` を丸めずに保持できることを必須とする。
   - 無損失な変換結果を保証できない場合は、部分的に再シリアライズした body を upstream に送らず、元の body bytes をそのまま転送して正規化をスキップする。
-  - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
+  - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters`、`input_schema` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
   - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
 1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
-   - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+   - 対象 schema の `anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
      1. すべての branch が `type: "object"` を持つこと。
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
      4. 各 branch の property の型・制約が互換であること。
-     5. `parameters` ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
+     5. 対象 schema ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
    - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。root と branch の object 制約が相互作用する場合を含め、条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
 
 2. **`type: "object"` の保証**
-   - `parameters.type` が未定義、空文字、または空オブジェクト `{}` の場合：
+   - 対象 schema が空オブジェクト、または `type` member が未定義/空文字列の場合：
      - `"type": "object"` を付与する
    - それ以外の既存 `type` は変更しない
 
 3. **空 `properties` の保持**
-   - `parameters.properties` が未定義の場合：
+   - 対象 schema の `properties` が未定義の場合：
      - `"properties": {}` を追加する
    - 既存の `properties` は保持する
 
@@ -240,6 +267,32 @@ apps/deno-relay/
 
 上記は 5.2 の条件を満たす「互換変換対象の `anyOf`」の例である。ただし、JSON Schema 上では `{"query": 123, "limit": 1}` のようなインスタンスが元 schema では valid だが、変換後の schema では invalid となるため、本変換は strict な意味保存ではなく、対象プロバイダの strict バリデータを通すための互換策である。
 
+### 5.4 Anthropic Messages 形状の例
+
+入力：
+
+```json
+{
+  "model": "command-code",
+  "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "hello"}],
+  "tools": [{
+    "name": "greptile_search",
+    "input_schema": {
+      "anyOf": [
+        { "type": "object", "properties": { "query": { "type": "string" } } },
+        { "type": "object", "properties": { "limit": { "type": "integer" } } }
+      ]
+    }
+  }]
+}
+```
+
+`POST /upstream/command-code/v1/messages` で上記を受けた場合は、OpenAI 例と同じ
+条件・意味の狭め込みを `tools[].input_schema` にだけ適用し、`name`、`messages`、
+その他の body bytes は変更しない。`/v1/chat/completions` で同じ body を受けた場合は
+Anthropic 形状として認識せず、`input_schema` を変更しない。
+
 ## 6. エラーハンドリング
 
 | 状況 | ステータス | ボディ | 備考 |
@@ -249,9 +302,14 @@ apps/deno-relay/
 | 未知の provider slug | `404` | `Not Found` | upstream fetch 前 |
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
 | リクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | `{"error":"invalid_json_body"}` | 汎用経路のみ。upstream fetch 前に返す |
+| generic `/upstream/*` の upstream 3xx | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
 | その他の upstream fetch エラー | 伝播または pass-through | - | - |
+
+既存 `/v1/responses` の upstream 3xx は後方互換のため、従来どおり status、サニタイズ
+後の headers（`Location` を含む）、body を pass-through する。上記の `502` 契約は
+新規 generic `/upstream/*` にだけ適用する。
 
 ## 7. 設定
 
@@ -260,8 +318,21 @@ apps/deno-relay/
 | 変数名 | 必須 | 説明 | 既定値 |
 |---|---|---|---|
 | `RELAY_SECRET` | ◯ | Gateway とリレー間の共通シークレットトークン | - |
-| `UPSTREAM_HEADER_TIMEOUT_MS` | - | 上流初期応答タイムアウト | 30000 |
-| `SSE_IDLE_TIMEOUT_MS` | - | SSE アイドルタイムアウト | 120000 |
+| `UPSTREAM_HEADER_TIMEOUT_MS` | - | 上流初期応答タイムアウト（整数 milliseconds、`1` 以上 `3_600_000` 以下） | 30000 |
+| `SSE_IDLE_TIMEOUT_MS` | - | SSE アイドルタイムアウト（整数 milliseconds、`1` 以上 `3_600_000` 以下） | 120000 |
+
+`config.ts` の pure config loader は startup 時に両 timeout を parse する。環境変数が
+`undefined` の場合だけ既定値を使用し、空文字列は未設定とはみなさない。前後の ASCII
+whitespace を除去した値が `[1-9][0-9]*` に一致し、`1` 以上 `3_600_000` 以下の
+finite integer milliseconds であることを要求する。`0`、負数、符号付き表記、小数、
+`30s` 等の非数値、`NaN`、`Infinity`、上限超過値は設定エラーとする。
+
+設定エラー時は default への silent fallback や `Number(raw) || default` を行わず、
+`Deno.serve` を開始しない fail-closed 起動失敗とする。診断は変数名と理由だけを含め、
+secret、credential、request body を含めない。`main.ts` は loader の結果を
+`upstreamHeaderTimeoutMs` / `sseIdleTimeoutMs` として handler に明示的に dependency
+injection し、handler は受け取った milliseconds を header timeout と SSE idle timeout
+の実処理へ伝播させる。`RELAY_SECRET` 未設定時の既存 `503` 契約は変更しない。
 
 ### 7.2 プリセットプロバイダ
 
@@ -299,9 +370,12 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 
 ### 9.1 schema_test.ts（新規）
 
-以下をカバーする単体テストを作成する。
+以下をカバーする単体テストを作成する。OpenAI と Anthropic の schema member は、
+route/request shape を混同しない別ケースとして扱う。
 
-- 互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
+- `/v1/chat/completions` の `tools[].function.parameters` と `/v1/messages` の `tools[].input_schema` について、互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
+- Anthropic `input_schema.anyOf` の flatten、`type` / `properties` 欠落の補完、および既に有効な `input_schema` の無改変
+- OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を含む body を受けた場合に、誤って正規化しないこと
 - `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
 - 同名 property が異なる type を持つ場合は変換しない
 - `additionalProperties: false` を含む場合は変換しない
@@ -310,11 +384,11 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - 条件を満たさない `anyOf` を持つスキーマが、silent semantic corruption なく無改変で通過すること
 - **変換前後の validation 結果比較**: 5.3 の例に対し、変換前は valid だが変換後は invalid となるインスタンス（例: `{"query": 123, "limit": 1}`）を含め、flatten が OR を AND 的制約に置き換えることを検証する
 - 5.3 に掲載された anyOf 例そのものをテストケース化し、入力・出力ともに期待通りであること
-- `type` の補完（未定義 / 空 / 空オブジェクト）
-- 空 `properties` の補完
+- `type` の補完（未定義 / 空文字列 / 空 schema object）を OpenAI / Anthropic の双方で検証
+- 空 `properties` の補完を OpenAI / Anthropic の双方で検証
 - 引数なしツールの正規化
-- 既存の正しいスキーマは無改変
-- `messages` や他フィールドが残ること
+- 既存の正しい schema は OpenAI / Anthropic の双方で無改変
+- `messages`、別フィールド、`messages` 内の無関係な `input_schema` が残ること
 - string 値内の `{`、`}`、`[`、`]`、`,`、`:` が構造 delimiter として誤認されないこと
 - escaped quote、backslash、`\u0000` 形式の escape を含む string が正しく scan されること
 - `messages` 内の文字列としての `"tools"` や JSON source が member path として誤認されないこと
@@ -339,14 +413,18 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
-- upstream mock が 302 または 307（`Location` と body 付き）を返した場合に、redirect 先を追加 fetch せず、status・`Location` を含む許可済み response headers・body を透過すること（upstream fetch call count は 1）
+- generic `/upstream/*` の upstream mock が 302 または 307（`Location` と body 付き）を返した場合に、`502` / `{"error":"upstream_redirect_not_allowed"}` へ変換し、`Location`、upstream headers、body を返さず、追加 fetch を行わないこと（upstream fetch call count は 1）
+- generic `/upstream/*` で absolute cross-origin、absolute same-provider、relative の各 `Location` を拒否し、クライアントが Gateway 外へ follow できる `Location` を downstream に返さないこと
+- generic `/upstream/*` の 307 POST で、元の body が最初の upstream request に一度だけ届き、redirect 先への二度目の request や認証 header の別 origin 送信がないこと
+- legacy `/v1/responses` の upstream mock が 302 / 307 を返した場合に、既存互換どおり status・サニタイズ後の `Location` を含む headers・body を pass-through すること
 - **GET `/upstream/command-code/v1/models` の転送**: upstream mock で以下を assert する
   - `method === "GET"`
   - body なし（または `null` / `undefined`）
   - URL === `https://api.commandcode.ai/provider/v1/models`
   - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
   - `X-Relay-Authorization` は upstream に届かない
-- POST `/upstream/command-code/v1/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で tools 正規化が行われること
+- POST `/upstream/command-code/v1/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で `tools[].function.parameters` の正規化が行われること
+- POST `/upstream/command-code/v1/messages` において、Anthropic tool の `tools[].input_schema` が同じ安全条件・lossless 条件で正規化されること
 - POST `/upstream/command-code/v1/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、body `{"error":"invalid_json_body"}`、upstream fetch call count `0` となること
 - `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は同じ `400` / `{"error":"invalid_json_body"}` となり、upstream fetch call count が `0` であること
 - POST + `application/json` の空 body（body なしを含む）は `400` / `{"error":"invalid_json_body"}` とし、upstream fetch call count が `0` であること
@@ -373,7 +451,19 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
 - `/v1/responses` が `Authorization` / `X-Relay-Authorization` を受け付けないこと（推奨、省略可）
 
-### 9.3 performance_test.ts（新規）
+### 9.3 config_test.ts（新規）
+
+`config.ts` の pure loader と production wiring を、次のケースで検証する。
+
+- `UPSTREAM_HEADER_TIMEOUT_MS` / `SSE_IDLE_TIMEOUT_MS` が env 未設定の場合、それぞれ `30000` / `120000` になること
+- 正の整数 override がその値の milliseconds として返ること
+- `"0"`、負数、`"30s"` 等の非数値、小数、空文字列、`NaN`、`Infinity`、`3_600_000` 超過値が設定エラーになること
+- `1` と `3_600_000` は有効であること
+- invalid env で default に戻らず、startup が fail-closed になること
+- valid override が `main.ts` の production dependency wiring を通じて handler の header timeout と SSE idle timeout の実 timer delay に伝播すること
+- timeout の単位が milliseconds であり、値の丸め・暗黙の `0` 化・silent coercion がないこと
+
+### 9.4 performance_test.ts（新規）
 
 以下を target Deno Deploy 環境とローカルの比較用 benchmark で測定する。
 
@@ -411,12 +501,12 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 
 ## 12. 移行手順
 
-1. `apps/deno-relay/relay.ts` を `forward.ts` / `router.ts` / `chatgpt.ts` / `upstream.ts` / `schema.ts` / `types.ts` に再編成
-2. `main.ts` を新しい構成に対応させる
-3. `schema_test.ts` を新規作成
-4. `relay_test.ts` を拡張
+1. `apps/deno-relay/relay.ts` を `forward.ts` / `router.ts` / `chatgpt.ts` / `upstream.ts` / `schema.ts` / `config.ts` / `types.ts` に再編成
+2. `main.ts` を新しい構成に対応させ、`config.ts` の検証済み timeout を dependency injection する
+3. `schema_test.ts` と `config_test.ts` を新規作成
+4. `relay_test.ts` を拡張し、generic 3xx 拒否と legacy redirect 互換を分けて検証
 5. 既存の `deno test apps/deno-relay` / `deno lint` / `deno fmt --check` がすべて通ることを確認
-6. Deno Deploy 側で `RELAY_SECRET` を設定済みであることを確認
+6. Deno Deploy 側で `RELAY_SECRET` を設定済みであることを確認し、timeout env は定義する場合に仕様の範囲内で設定する
 7. Cloudflare AI Gateway の `command-code` Custom Provider の `base_url` を `https://<relay-domain>.deno.dev/upstream/command-code/` に変更
 8. Cloudflare AI Gateway の `command-code` Custom Provider において、リレー認証用ヘッダーとして `X-Relay-Authorization: Bearer <RELAY_SECRET>` を設定する。標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。
 9. 既存 `chatgpt-codex-deno` provider は `base_url` を変更せず継続利用
