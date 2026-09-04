@@ -140,6 +140,15 @@ OpenAI の `/v1/chat/completions` では `tools[].function.parameters`、Anthrop
 root `anyOf` がない場合、または安全な flatten に成功した場合だけ、欠落した `type`
 や `properties` を補完します。
 
+`POST` かつ `Content-Type` の media type が `application/json` の body を解析できない
+場合、汎用経路は route-specific な provider-compatible `400` envelope を upstream
+fetch 前に返します。`/v1/chat/completions` は OpenAI shape
+`{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`、
+`/v1/messages` は Anthropic shape
+`{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`
+です。空 body も同じ扱いとし、universal な `{"error":"invalid_json_body"}` は返しません。
+既存の `/v1/responses` はこの解析を行いません。
+
 汎用経路の upstream `401`、`403`、`429`、`5xx` および通常の response は pass-through
 します。upstream の 3xx は、absolute cross-origin、absolute same-provider、relative
 な `Location` を問わず `502 {"error":"upstream_redirect_not_allowed"}` に変換し、
@@ -215,7 +224,7 @@ PAT (classic) を準備してください。
 
 1. [ ] OpenCode が `PluginInput` でホストバージョン能力を公開したリリースが出ていること。さらに activate 拒否時にホスト側が一致する Codex リクエストを block できること（拒否だけでは direct request を防げない）。
 2. [ ] `SUPPORTED_OPENCODE_RANGE` と `peerDependencies.opencode` を実際の能力提供バージョンに更新し、`test/package-consistency.test.ts` を通すこと。
-3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth 認証情報）を `protected-acceptance` 環境で実行し、200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモード、Gateway log 作成、パスマッピングを確認すること。
+3. [ ] 保護付き acceptance suite（実 Cloudflare / Deno Deploy / ChatGPT OAuth / Command Code 認証情報）を `protected-acceptance` 環境で実行し、legacy の 200 SSE、tool call、reasoning、token refresh、代表エラー、両ログペイロードモードに加え、generic `command-code` の OpenAI/Anthropic/models path、provider-compatible error envelope、header injection、Gateway log 作成、パスマッピングを確認すること。必須値が未設定の場合は skip せず fail させること。
 4. [ ] README のサポート範囲表記を更新すること。
 5. [ ] 初回の手動公開前に、`write:packages` 権限を持つ GitHub PAT
    (classic) で GitHub Packages registry に認証すること。その後、

@@ -91,7 +91,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取り、`config.ts` の検証済み timeout を依存注入 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。3xx の response policy は route ごとに分け、generic route は拒否、legacy route は互換 pass-through とする |
 | `schema.ts` | route に対応する `tools[].function.parameters` または `tools[].input_schema` の正規化実装 |
 | `config.ts` | `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` を既定値・範囲付き整数 milliseconds として parse し、不正値で fail-closed にする |
@@ -118,7 +118,7 @@ apps/deno-relay/
                              ├─ containment 違反/検証不能 → 404（fetch 0 回）
                              ├─ HTTP method をそのまま forward
                              ├─ POST + application/json の場合のみ lossless token scan/transform
-                             ├─ JSON parse 失敗 → 400 `{"error":"invalid_json_body"}`（upstream fetch 前）
+                             ├─ JSON parse 失敗 → route-specific provider-compatible 400（upstream fetch 前）
                              ├─ route に対応する tools schema を schema.ts で正規化
                              ├─ containment 検証済みの upstream URL と query を forward
                              └─ forward.ts で `redirect: "manual"` を指定し、generic の 3xx を拒否
@@ -305,11 +305,20 @@ Anthropic 形状として認識せず、`input_schema` を変更しない。
 | 認証ヘッダー欠落/不一致 | `401` | `{"error":"unauthorized"}` | upstream fetch 前 |
 | 未知の provider slug | `404` | `Not Found` | upstream fetch 前 |
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
-| リクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | `{"error":"invalid_json_body"}` | 汎用経路のみ。upstream fetch 前に返す |
+| リクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | 汎用経路のみ。`command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
 | generic `/upstream/*` の upstream 3xx | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
 | その他の upstream fetch エラー | 伝播または pass-through | - | - |
+
+既知の `command-code` route で生成する JSON parse failure は、provider-compatible
+error shape を使用する。`/v1/chat/completions` は OpenAI shape
+`{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`、
+`/v1/messages` は Anthropic shape
+`{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`
+とする。どちらも secret、credential、request body の内容を含めず、upstream fetch
+を実行しない。provider preset を追加する場合は、その provider の error envelope を
+定義してから有効化し、universal な `{"error":"invalid_json_body"}` は返さない。
 
 既存 `/v1/responses` の upstream 3xx は後方互換のため、従来どおり status、サニタイズ
 後の headers（`Location` を含む）、body を pass-through する。上記の `502` 契約は
@@ -430,9 +439,10 @@ route/request shape を混同しない別ケースとして扱う。
   - `X-Relay-Authorization` は upstream に届かない
 - POST `/upstream/command-code/v1/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で `tools[].function.parameters` の正規化が行われること
 - POST `/upstream/command-code/v1/messages` において、Anthropic tool の `tools[].input_schema` が同じ安全条件・lossless 条件で正規化されること
-- POST `/upstream/command-code/v1/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、body `{"error":"invalid_json_body"}`、upstream fetch call count `0` となること
-- `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は同じ `400` / `{"error":"invalid_json_body"}` となり、upstream fetch call count が `0` であること
-- POST + `application/json` の空 body（body なしを含む）は `400` / `{"error":"invalid_json_body"}` とし、upstream fetch call count が `0` であること
+- POST `/upstream/command-code/v1/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、OpenAI-compatible error envelope `{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`、upstream fetch call count `0` となること
+- POST `/upstream/command-code/v1/messages` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、Anthropic-compatible error envelope `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`、upstream fetch call count `0` となること
+- `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は route に対応する同じ provider-compatible envelope となり、upstream fetch call count が `0` であること
+- POST + `application/json` の空 body（body なしを含む）は、route に対応する provider-compatible `400` envelope とし、upstream fetch call count が `0` であること
 - `text/plain` または不正な `Content-Type` では tools 正規化のための JSON パースを行わないこと
 - GET `/upstream/command-code/v1/models` では body を JSON パースせず、そのまま転送されること
 - HTTP method のそのまま転送（例: GET, POST）
@@ -479,6 +489,26 @@ route/request shape を混同しない別ケースとして扱う。
 - ローカル benchmark は実装比較と回帰検知に使い、Deno Deploy の plan/runtime/resource limit の代替証拠にはしないこと
 - 大容量 fixture の raw bytes、unsafe integer、UTF-8 byte offset、複数 patch の無損失性は `schema_test.ts` と `relay_test.ts` の機能テストでも引き続き検証すること
 
+### 9.5 protected acceptance（release gate）
+
+- 既存 `acceptance_test.ts` の legacy `/v1/responses` 検証と、汎用 `command-code`
+  acceptance は別のテスト群として実装する。後者は実 Cloudflare AI Gateway Custom
+  Provider、実 Deno Deploy relay、実 Command Code Provider API を通る手動 workflow
+  でのみ実行し、mock の統合テストを代替証拠としない。
+- 汎用 acceptance は、OpenAI の
+  `.../custom-command-code/v1/chat/completions`、Anthropic の
+  `.../custom-command-code/v1/messages`、両 SDK の `/v1/models` に対応する request
+  を送り、成功 response、provider-compatible malformed/empty JSON error envelope、
+  path mapping、および upstream での credential 分離を確認する。
+- `X-Relay-Authorization` は Custom Provider 設定の `headers` から注入され、標準
+  `Authorization` は Command Code credential として upstream に届くことを確認する。
+  Cloudflare API reference は `headers` を optional string として定義しているが、
+  その serialization と secret forwarding を説明していないため、設定が実際に
+  機能することを acceptance の必須条件とする。
+- Gateway base URL、Gateway token、Command Code API key は protected Environment の
+  variables/secrets から注入し、workflow のログへ出力しない。必須値が欠落した場合は
+  skip せず release gate を fail させる。
+
 ## 10. Future 拡張（Roadmap）
 
 本設計では意図的にスコープ外とし、後続の拡張として SPEC.md/README.md に残す項目。
@@ -513,5 +543,6 @@ route/request shape を混同しない別ケースとして扱う。
 5. 既存の `deno test apps/deno-relay` / `deno lint` / `deno fmt --check` がすべて通ることを確認
 6. Deno Deploy 側で `RELAY_SECRET` を設定済みであることを確認し、timeout env は定義する場合に仕様の範囲内で設定する
 7. Cloudflare AI Gateway の `command-code` Custom Provider の `base_url` を `https://<relay-domain>.deno.dev/upstream/command-code/` に変更
-8. Cloudflare AI Gateway の `command-code` Custom Provider において、リレー認証用ヘッダーとして `X-Relay-Authorization: Bearer <RELAY_SECRET>` を設定する。標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。
-9. 既存 `chatgpt-codex-deno` provider は `base_url` を変更せず継続利用
+8. Cloudflare API reference の Custom Provider `headers` field の現行仕様に従って、`command-code` provider にリレー認証用ヘッダー `X-Relay-Authorization: Bearer <RELAY_SECRET>` を設定する。標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。serialization と secret forwarding が実環境で確認できない場合は provider を有効化しない。
+9. `protected-acceptance` workflow で実 Cloudflare AI Gateway → Deno Deploy → Command Code の OpenAI/Anthropic/models path、provider-compatible error envelope、header injection、Gateway log 作成を確認する。必須 Environment variables/secrets が未設定の場合は skip せず fail させる。
+10. 既存 `chatgpt-codex-deno` provider は `base_url` を変更せず継続利用

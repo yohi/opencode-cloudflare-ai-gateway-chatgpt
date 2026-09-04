@@ -137,9 +137,24 @@
       parse failure の規約を除き、スキーマ正規化を行わない。
   - **JSON body parse failure**:
     - `/upstream/*` の POST かつ media type が `application/json` の場合、body
-      の JSON パースに失敗したら、upstream fetch の前に status `400`、body
-      `{"error":"invalid_json_body"}` を返す。
-    - 空の body（body なしを含む）も JSON パース失敗として同じ扱いとする。
+      の JSON パースに失敗したら、対応する provider route の互換 error envelope
+      を upstream fetch の前に status `400` で返す。既知の provider route
+      に対して universal な `{"error":"invalid_json_body"}` envelope
+      を返してはならない。
+    - `command-code` の `/v1/chat/completions` は OpenAI-compatible envelope
+      `{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`
+      を返す。
+    - `command-code` の `/v1/messages` は Anthropic-compatible envelope
+      `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`
+      を返す。
+    - 空の body（body なしを含む）も JSON パース失敗として、route に応じた同じ
+      envelope を返す。response の `Content-Type` は `application/json` とし、
+      secret、credential、request body の一部を error message に含めない。
+    - provider preset を追加する場合は、provider-native error envelope と
+      malformed body のテストを定義してから有効化する。対応する envelope
+      が未定義の route は、provider-compatible endpoint
+      として公開してはならない。
+    - この処理では upstream fetch を実行しない。
     - 既存の `/v1/responses` 経路では body
       をパースせず、従来のストリーミング転送を維持する。
   - **JSON 数値の無損失保持**:
@@ -348,6 +363,13 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
   - 標準 `Authorization` ヘッダーは Command Code API
     key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay
     を経由して上流へ透過される。
+- Cloudflare API reference は Custom Provider の `headers` を optional string
+  （`maxLength: 8192`）として公開しているが、現行の設定ガイドはその値の
+  serialization、secret 管理、upstream 転送規則を定義していない。したがって、
+  `headers` の具体的な形式を推測して運用してはならず、protected acceptance で
+  `X-Relay-Authorization` の注入と標準 `Authorization`
+  の透過を実測できる設定だけを release configuration として採用する。secret
+  の実値は repository に保存しない。
 - **クライアント path**:
   - OpenAI SDK の base URL は `.../custom-command-code/v1` とし、SDK が付加する
     `/chat/completions` により Gateway から relay へ
@@ -384,6 +406,33 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
 - config loader は env 未設定、正の整数
   override、`0`、負数、非数値、空文字列、上限超過値を 検証し、valid override が
   header timeout と SSE idle timeout の実処理へ伝播することを 検証する。
+
+### 5.4 Protected acceptance
+
+- 実装完了後の release gate として、`protected-acceptance` GitHub Environment
+  から手動実行する実環境 acceptance suite を用意する。既存の legacy
+  `/v1/responses` acceptance と、汎用 `command-code` acceptance
+  は別のテスト群として扱う。
+- 汎用 acceptance は、実 Cloudflare AI Gateway Custom Provider、実 Deno Deploy
+  relay、実 Command Code Provider API の経路を使用し、少なくとも次を検証する。
+  - OpenAI SDK 相当の `POST .../custom-command-code/v1/chat/completions` が
+    relay の `/upstream/command-code/v1/chat/completions`
+    を経由して成功すること。
+  - Anthropic SDK 相当の `POST .../custom-command-code/v1/messages` が relay の
+    `/upstream/command-code/v1/messages` を経由して成功すること。
+  - 両 route の `GET .../v1/models` が
+    `https://api.commandcode.ai/provider/v1/models` へ対応すること。
+  - 両 route の malformed/empty JSON が status `400` となり、OpenAI または
+    Anthropic の対応する provider-native error envelope を返すこと。
+  - relay の固定認証が成功し、Command Code API key の `Authorization` は
+    upstream credential として機能し、`X-Relay-Authorization` は upstream
+    に漏洩しないこと。
+  - Cloudflare Gateway log が作成され、provider path mapping
+    が期待値と一致すること。
+- acceptance の endpoint、Gateway token、Command Code API key、relay secret は
+  protected Environment の variables/secrets から注入し、workflow
+  のログに出力しない。必須値が未設定の場合は skip せず、release gate を fail
+  させる。
 
 ---
 
