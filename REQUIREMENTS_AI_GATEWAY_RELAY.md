@@ -74,6 +74,10 @@
 ### 3.2 リクエストサニタイズ機能（スキーマ正規化パイプライン）
 - **Tool Schema Normalization（ツール定義の正規化）**:
   - 対象: `Content-Type` を HTTP media type として解釈した type/subtype が `application/json`（パラメータ付き表記および type/subtype の大文字小文字違いを含む）かつ `body.tools` が配列の場合。
+  - **JSON body parse failure**:
+    - `/upstream/*` の POST かつ media type が `application/json` の場合、body の JSON パースに失敗したら、upstream fetch の前に status `400`、body `{"error":"invalid_json_body"}` を返す。
+    - 空の body（body なしを含む）も JSON パース失敗として同じ扱いとする。
+    - 既存の `/v1/responses` 経路では body をパースせず、従来のストリーミング転送を維持する。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
     - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
@@ -99,6 +103,8 @@
   - Cloudflare 内部ヘッダー（`cf-*`, `cf-aig-*`, `x-forwarded-*`）を上流へ流さないよう除去。
   - リレー認証ヘッダー（`X-Relay-Authorization`、`X-ChatGPT-Relay-Authorization`）を上流へ漏洩させない。
   - 標準 `Authorization` ヘッダーは上流プロバイダーの認証情報として保持・転送する。
+- **リダイレクト制御**:
+  - `/v1/responses` と `/upstream/*` の共通 upstream fetch は `RequestInit.redirect: "manual"` を指定し、upstream の 3xx を `Location` に従って自動取得しない。3xx の status、サニタイズ後の response headers（`Location` を含む）、body は relay response として透過する。
 
 ### 3.4 レスポンスストリーミング（SSE）中継
 - **完全透過ストリーミング**:
