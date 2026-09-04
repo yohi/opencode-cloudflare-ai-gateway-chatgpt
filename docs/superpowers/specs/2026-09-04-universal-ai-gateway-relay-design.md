@@ -49,7 +49,7 @@ Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブと�
 │        │                                                    │
 │  [2. 認証検証]                                               │
 │        ├─ /v1/responses: X-ChatGPT-Relay-Authorization      │
-│        └─ /upstream/*: Authorization / X-Relay-Authorization│
+│        └─ /upstream/*: X-Relay-Authorization               │
 │        │                                                    │
 │  [3. リクエストサニタイズ（汎用経路のみ）]                      │
 │        └─ tools[].function.parameters の正規化              │
@@ -87,7 +87,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、body パース、スキーマ正規化、upstream URL 構築。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の body パース・スキーマ正規化、upstream URL 構築。upstream URL は `preset base URL + 残りパス・クエリ` で構築する（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理 |
 | `schema.ts` | `tools[].function.parameters` の正規化実装 |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
@@ -107,7 +107,8 @@ apps/deno-relay/
    └─ /upstream/<slug>/* ──▶ [upstream.ts]
                              ├─ slug 解決（command-code）
                              ├─ 未知 slug → 404
-                             ├─ body JSON パース
+                             ├─ HTTP method をそのまま forward
+                             ├─ POST + application/json の場合のみ body JSON パース
                              ├─ schema.ts で tools 正規化
                              ├─ upstream URL = base + 残りパス・クエリ
                              └─ forward.ts で転送
@@ -151,13 +152,13 @@ apps/deno-relay/
 
 各 `tools[].function.parameters` に対し、以下を適用する。
 
-1. **`anyOf` の条件付き解消**
+1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
    - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
      1. すべての branch が `type: "object"` を持つこと。
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
      4. 各 branch の property の型・制約が互換であること。
-   - 上記条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
+   - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
 
 2. **`type: "object"` の保証**
    - `parameters.type` が未定義、空文字、または空オブジェクト `{}` の場合：
@@ -188,8 +189,8 @@ apps/deno-relay/
       "name": "greptile_search",
       "parameters": {
         "anyOf": [
-          { "properties": { "query": { "type": "string" } } },
-          { "properties": { "limit": { "type": "integer" } } }
+          { "type": "object", "properties": { "query": { "type": "string" } } },
+          { "type": "object", "properties": { "limit": { "type": "integer" } } }
         ]
       }
     }
@@ -219,7 +220,7 @@ apps/deno-relay/
 }
 ```
 
-上記はあくまで「安全に flatten できる `anyOf`」の例である。実際の実装では 5.2 の条件を厳密に検証し、条件を満たさない `anyOf` は変換せずそのまま残す。
+上記は 5.2 の条件を満たす「互換変換対象の `anyOf`」の例である。ただし、JSON Schema 上では `{"query": 123, "limit": 1}` のようなインスタンスが元 schema では valid だが、変換後の schema では invalid となるため、本変換は strict な意味保存ではなく、対象プロバイダの strict バリデータを通すための互換策である。
 
 ## 6. エラーハンドリング
 
@@ -269,12 +270,14 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 
 以下をカバーする単体テストを作成する。
 
-- 安全な `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし）
+- 互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、すべての branch が `type: "object"`）
 - `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
 - 同名 property が異なる type を持つ場合は変換しない
 - `additionalProperties: false` を含む場合は変換しない
 - `enum` / `const` 等の制約を含む場合は変換しない
 - 条件を満たさない `anyOf` を持つスキーマが、silent semantic corruption なく無改変で通過すること
+- **変換前後の validation 結果比較**: 5.3 の例に対し、変換前は valid だが変換後は invalid となるインスタンス（例: `{"query": 123, "limit": 1}`）を含め、flatten が OR を AND 的制約に置き換えることを検証する
+- 5.3 に掲載された anyOf 例そのものをテストケース化し、入力・出力ともに期待通りであること
 - `type` の補完（未定義 / 空 / 空オブジェクト）
 - 空 `properties` の補完
 - 引数なしツールの正規化
@@ -289,11 +292,20 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 
 - `/upstream/command-code/chat/completions` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/chat/completions` 完全一致）
 - `/upstream/command-code/messages` への転送と upstream URL 検証
-- `/upstream/command-code/models` への転送と upstream URL 検証
+- **GET `/upstream/command-code/models` の転送**: upstream mock で以下を assert する
+  - `method === "GET"`
+  - body なし（または `null` / `undefined`）
+  - URL === `https://api.commandcode.ai/provider/v1/models`
+  - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
+  - `X-Relay-Authorization` は upstream に届かない
+- POST `/upstream/command-code/chat/completions` において、`Content-Type: application/json` なら body を JSON パースし tools 正規化が行われること
+- GET `/upstream/command-code/models` では body を JSON パースせず、そのまま転送されること
+- HTTP method のそのまま転送（例: GET, POST）
 - query string の保持
 - `/provider/v1/v1/...` が生成されない回帰テスト
 - 未知 provider slug での `404`
 - `X-Relay-Authorization` 認証成功
+- `Authorization: Bearer <RELAY_SECRET>` のみでは `/upstream/*` の relay auth に成功しないこと
 - `Authorization: Bearer <CMD_API_KEY>` と `X-Relay-Authorization: Bearer <RELAY_SECRET>` が同時に存在すると認証成功
 - upstream mock には `Authorization` の `<CMD_API_KEY>` がそのまま届く
 - `X-Relay-Authorization` は upstream に届かない
