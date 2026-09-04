@@ -119,9 +119,10 @@
 ### 3.2 リクエストサニタイズ機能（スキーマ正規化パイプライン）
 
 - **Tool Schema Normalization（ツール定義の正規化）**:
-  - 対象: `Content-Type` を HTTP media type として解釈した type/subtype が
+  - 対象: provider preset が provider-compatible route として定義した `POST`、
+    `Content-Type` を HTTP media type として解釈した type/subtype が
     `application/json`（パラメータ付き表記および type/subtype
-    の大文字小文字違いを含む）かつ `body.tools` が配列の場合。
+    の大文字小文字違いを含む）、かつ `body.tools` が配列の場合。
   - **リクエスト形状の識別**:
     - `POST /upstream/<provider-slug>/v1/chat/completions` では、`tools[]`
       の要素が `type: "function"`、`function` オブジェクト、およびその
@@ -134,13 +135,15 @@
     - URL pathname を API 形状の主な識別子とし、OpenAI 経路で `input_schema`
       を、Anthropic 経路で `function.parameters` を検出しただけでは
       変換しない。上記以外の route、method、または形状不一致の body は、JSON
-      parse failure の規約を除き、スキーマ正規化を行わない。
+      parse failure の規約を除き、スキーマ正規化を行わない。provider-compatible
+      route として未定義の route/method は JSON parse も行わず、body を raw
+      forward する。
   - **JSON body parse failure**:
-    - `/upstream/*` の POST かつ media type が `application/json` の場合、body
-      の JSON パースに失敗したら、対応する provider route の互換 error envelope
-      を upstream fetch の前に status `400` で返す。既知の provider route
-      に対して universal な `{"error":"invalid_json_body"}` envelope
-      を返してはならない。
+    - provider preset が malformed JSON envelope を定義した既知 provider route
+      で、POST かつ media type が `application/json` の場合に body の JSON
+      パースに失敗したら、対応する provider route の互換 error envelope を
+      upstream fetch の前に status `400` で返す。既知の provider route に対して
+      universal な `{"error":"invalid_json_body"}` envelope を返してはならない。
     - `command-code` の `/v1/chat/completions` は OpenAI-compatible envelope
       `{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`
       を返す。
@@ -152,8 +155,10 @@
       secret、credential、request body の一部を error message に含めない。
     - provider preset を追加する場合は、provider-native error envelope と
       malformed body のテストを定義してから有効化する。対応する envelope
-      が未定義の route は、provider-compatible endpoint
-      として公開してはならない。
+      が未定義の route は JSON parse と relay-generated error envelope
+      の対象にせず、provider-compatible endpoint
+      として公開してはならない。未定義 route を受け付ける場合は、JSON parse
+      を行わず body を raw forward する。
     - この処理では upstream fetch を実行しない。
     - 既存の `/v1/responses` 経路では body
       をパースせず、従来のストリーミング転送を維持する。
@@ -183,8 +188,9 @@
       body を生成せず、元の body bytes をそのまま upstream
       へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの
       silent data corruption は許容しない。
-  - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
-    - 対象 schema の root に `anyOf`
+  - **OpenAI route の `anyOf` 互換性変換（意図的な意味の狭め込み）**:
+    - OpenAI の `/v1/chat/completions` にある `tools[].function.parameters`
+      の対象 schema の root に `anyOf`
       が存在する場合、以下の条件をすべて満たすときのみ、各 branch の
       `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
@@ -209,7 +215,7 @@
       skip** とし、`type: "object"` や `properties: {}` の補完を含む対象 schema
       全体の正規化を行わない。`anyOf`、その branch、schema 内の全 member、および
       対応する request body byte span は入力のまま保持する。flatten
-      に成功した場合、 または root `anyOf` が存在しない場合に限り、後続の `type`
+      に成功した場合、または root `anyOf` が存在しない場合に限り、後続の `type`
       / `properties` 補完を適用できる。
     - 例えば、root `type` のない
       `{ "anyOf": [{ "type": "string" },
@@ -217,6 +223,11 @@
       は flatten 不可である。ここに root `type: "object"` を追加すると元の
       string branch を無効化するため、`type` / `properties`
       を追加せず完全に無改変とする。
+    - Anthropic の `/v1/messages` にある `tools[].input_schema` の root `anyOf`
+      は、 branch がすべて object であっても flatten しない。`anyOf`、その
+      branch、schema 内の全 member、および対応する request body byte span
+      を入力のまま保持し、 `type: "object"` / `properties: {}`
+      の補完も行わない。
   - **`type: "object"` の強制保証**:
     - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が
       空オブジェクト、もしくは `type` member が未定義/空文字列の場合、
@@ -384,10 +395,12 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
 
 - schema normalization は OpenAI の `tools[].function.parameters` と Anthropic
   の `tools[].input_schema` を別の route/request shape として検証する。
-- `/upstream/<slug>/v1/messages` の `input_schema.anyOf`、`type` / `properties`
-  欠落、 既に有効な schema の無変更、`messages` 内や別フィールドの無関係な
-  schema の無変更を 検証する。OpenAI route では `function.parameters`、Anthropic
-  route では `input_schema` のみが対象となることも検証する。
+- `/upstream/<slug>/v1/messages` の `input_schema.anyOf` が flatten されず、root
+  `anyOf` がある場合は `type` / `properties` 補完を含めて byte-for-byte
+  無変更であること、 root `anyOf` がない場合の既存補完、`messages`
+  内や別フィールドの無関係な schema の 無変更を検証する。OpenAI route では
+  `function.parameters`、Anthropic route では `input_schema`
+  のみが対象となることも検証する。
 - 条件を満たさない root `anyOf` は、`type` / `properties` 補完を含む対象 schema
   の normalization 全体を skip し、対象 schema の UTF-8 byte span
   が完全一致することを 検証する。対象 schema だけを含む fixture では request

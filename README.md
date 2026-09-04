@@ -127,26 +127,32 @@ https://chatgpt.com/backend-api/codex/responses
 
 さらに、リクエストの `Connection` ヘッダーを case-insensitive な comma-separated token list として解析し、そのリストに挙げられた各ヘッダーも除去します。応答ヘッダーについても同様に `Connection` とその token に挙げられた名前、および標準 hop-by-hop ヘッダーを除去します。残りの upstream 応答ヘッダー、status、body stream は保持されます。
 
-汎用経路では、`POST` かつ `Content-Type` の media type が `application/json` の場合に
-限り、body の raw/token-preserving scan で route に対応する tool schema を正規化します。
-OpenAI の `/v1/chat/completions` では `tools[].function.parameters`、Anthropic の
+汎用経路では、provider preset が provider-compatible route として定義した `POST` かつ
+`Content-Type` の media type が `application/json` の場合に限り、body の raw/token-preserving
+scan で route に対応する tool schema を正規化します。OpenAI の
+`/v1/chat/completions` では `tools[].function.parameters`、Anthropic の
 `/v1/messages` では `tools[].input_schema` のみを対象とし、別の route/request shape
 は変更しません。`messages` 等の対象外フィールドと JSON number token は保持します。
 
-対象 schema の root `anyOf` は、安全条件を満たす場合だけ flatten します。flatten
-できない `anyOf` は残し、`type: "object"` や `properties: {}` の補完を含む対象 schema
-の正規化全体をスキップして、対象 schema の request body byte span を入力のまま保持します。
-同じ body 内にある別の安全な対象 schema の正規化は妨げません。
-root `anyOf` がない場合、または安全な flatten に成功した場合だけ、欠落した `type`
-や `properties` を補完します。
+root `anyOf` の compatibility flatten は OpenAI の `/v1/chat/completions` にだけ適用します。
+Anthropic の `/v1/messages` では `tools[].input_schema` の root `anyOf` とその branch を
+変更しません。root `anyOf` が存在する対象 schema は、`type: "object"` や
+`properties: {}` の補完を含む正規化全体をスキップして、対象 schema の request body byte
+span を入力のまま保持します。OpenAI route で flatten できない `anyOf` も同じ扱いです。
+同じ body 内にある別の安全な OpenAI 対象 schema の正規化は妨げません。root `anyOf` が
+ない場合、または OpenAI route で安全な flatten に成功した場合だけ、欠落した `type` や
+`properties` を補完します。
 
-`POST` かつ `Content-Type` の media type が `application/json` の body を解析できない
-場合、汎用経路は route-specific な provider-compatible `400` envelope を upstream
-fetch 前に返します。`/v1/chat/completions` は OpenAI shape
+provider preset が malformed JSON の envelope を定義した既知 route では、`POST` かつ
+`Content-Type` の media type が `application/json` の body を解析できない場合、route-specific
+な provider-compatible `400` envelope を upstream fetch 前に返します。`/v1/chat/completions` は OpenAI shape
 `{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`、
 `/v1/messages` は Anthropic shape
 `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`
 です。空 body も同じ扱いとし、universal な `{"error":"invalid_json_body"}` は返しません。
+未知の pathname、method、または malformed JSON envelope が未定義の route では、relay は
+JSON parse を行わず body を raw forward します。その route を provider-compatible endpoint として
+公開するには、provider preset に route と envelope を先に定義する必要があります。
 既存の `/v1/responses` はこの解析を行いません。
 
 汎用経路の upstream `401`、`403`、`429`、`5xx` および通常の response は pass-through

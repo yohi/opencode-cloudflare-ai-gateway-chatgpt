@@ -91,7 +91,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取り、`config.ts` の検証済み timeout を依存注入 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、provider-compatible route として定義された POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。既知 route の JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。未知の route/method、または envelope 未定義 route は JSON parse せず body を raw forward する。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。3xx の response policy は route ごとに分け、generic route は拒否、legacy route は互換 pass-through とする |
 | `schema.ts` | route に対応する `tools[].function.parameters` または `tools[].input_schema` の正規化実装 |
 | `config.ts` | `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` を既定値・範囲付き整数 milliseconds として parse し、不正値で fail-closed にする |
@@ -117,9 +117,10 @@ apps/deno-relay/
                              ├─ origin と pathname prefix の containment 検証
                              ├─ containment 違反/検証不能 → 404（fetch 0 回）
                              ├─ HTTP method をそのまま forward
-                             ├─ POST + application/json の場合のみ lossless token scan/transform
-                             ├─ JSON parse 失敗 → route-specific provider-compatible 400（upstream fetch 前）
-                             ├─ route に対応する tools schema を schema.ts で正規化
+                             ├─ 既知 provider route の POST + application/json のみ lossless token scan/transform
+                             ├─ 既知 route の JSON parse 失敗 → route-specific provider-compatible 400（upstream fetch 前）
+                             ├─ 未知 route/method または envelope 未定義 → JSON parse せず raw forward
+                             ├─ 既知 route に対応する tools schema を schema.ts で正規化
                              ├─ containment 検証済みの upstream URL と query を forward
                              └─ forward.ts で `redirect: "manual"` を指定し、generic の 3xx を拒否
 ```
@@ -164,6 +165,7 @@ apps/deno-relay/
 
 ### 5.1 適用条件
 
+- provider preset が provider-compatible route として定義したこと
 - HTTP method が POST であること
 - `Content-Type` を HTTP media type として解釈した type/subtype が `application/json` であること（パラメータ付き表記を許容し、type/subtype は大文字小文字非依存で比較する）
 - ボディが JSON としてパース可能であること
@@ -181,7 +183,9 @@ route pathname を API request shape の主な識別子とし、対象 schema me
 OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を検出した
 だけでは変換しない。`input_schema` を持たない Anthropic server tool、上記以外の
 route/method、および shape 不一致の `tools[]` 要素も変更しない。JSON body の parse
-failure だけは 4.1 の汎用経路規約に従う。
+failure は provider-compatible envelope が定義された既知 route にだけ適用する。
+未知 route/method または envelope 未定義 route は JSON parse せず、body を raw forward
+する。
 
 ### 5.2 正規化ルール
 
@@ -196,8 +200,8 @@ failure だけは 4.1 の汎用経路規約に従う。
   - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters`、`input_schema` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
   - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
-1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
-   - 対象 schema の root に `anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+1. **OpenAI route の `anyOf` 互換性変換（意図的な意味の狭め込み）**
+   - `/v1/chat/completions` の `tools[].function.parameters` の root に `anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
      1. すべての branch が `type: "object"` を持つこと。
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
@@ -207,19 +211,23 @@ failure だけは 4.1 の汎用経路規約に従う。
    - flatten を実施しないと決定した場合は、その対象 schema を **normalization skip** とし、後続の `type: "object"` / `properties: {}` 補完を含む対象 schema 全体の正規化を行わない。`anyOf`、その branch、schema 内の全 member、および対応する request body byte span は入力のまま保持する。flatten に成功した場合、または root `anyOf` が存在しない場合に限り、後続の `type` / `properties` 補完を適用できる。
    - 例えば、root `type` のない `{ "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "query": { "type": "string" } } }] }` は flatten 不可である。ここに root `type: "object"` を追加すると元の string branch を無効化するため、`type` / `properties` を追加せず完全に無改変とする。
 
-2. **`type: "object"` の保証**
+2. **Anthropic Messages route の `anyOf` 保持**
+   - `/v1/messages` の `tools[].input_schema` に root `anyOf` が存在する場合、branch がすべて object であっても flatten しない。`anyOf`、その branch、schema 内の全 member、および対応する request body byte span を入力のまま保持する。
+   - Anthropic route の root `anyOf` は、`type: "object"` / `properties: {}` の補完を含む対象 schema 全体の normalization skip とする。root `anyOf` がない schema では、既存の `type` / `properties` 補完を適用できる。
+
+3. **`type: "object"` の保証**
    - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が空オブジェクト、もしくは `type` member が未定義/空文字列の場合：
       - `"type": "object"` を付与する
    - それ以外の既存 `type` は変更しない
    - flatten 不可として normalization skip になった対象 schema には、この補完を適用しない。
 
-3. **空 `properties` の保持**
+4. **空 `properties` の保持**
    - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema の `properties` が未定義の場合：
       - `"properties": {}` を追加する
    - 既存の `properties` は保持する
    - flatten 不可として normalization skip になった対象 schema には、この補完を適用しない。
 
-4. **その他フィールド**
+5. **その他フィールド**
    - `description` 等、`tools` 以外のフィールドには一切触れない。
    - `messages` 等、巨大なフィールドには一切触れない。
    - `required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` は、正規化前の値を保持する（anyOf flatten 適用外の場合）。
@@ -292,10 +300,11 @@ failure だけは 4.1 の汎用経路規約に従う。
 }
 ```
 
-`POST /upstream/command-code/v1/messages` で上記を受けた場合は、OpenAI 例と同じ
-条件・意味の狭め込みを `tools[].input_schema` にだけ適用し、`name`、`messages`、
-その他の body bytes は変更しない。`/v1/chat/completions` で同じ body を受けた場合は
-Anthropic 形状として認識せず、`input_schema` を変更しない。
+`POST /upstream/command-code/v1/messages` で上記を受けた場合は、Anthropic native
+schema の意味を維持するため `tools[].input_schema` の root `anyOf` を flatten せず、
+`anyOf`、branch、`name`、`messages`、その他の body bytes を変更しない。root `anyOf`
+があるため `type` / `properties` 補完も行わない。`/v1/chat/completions` で同じ body を
+受けた場合は Anthropic 形状として認識せず、`input_schema` を変更しない。
 
 ## 6. エラーハンドリング
 
@@ -305,7 +314,8 @@ Anthropic 形状として認識せず、`input_schema` を変更しない。
 | 認証ヘッダー欠落/不一致 | `401` | `{"error":"unauthorized"}` | upstream fetch 前 |
 | 未知の provider slug | `404` | `Not Found` | upstream fetch 前 |
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
-| リクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | 汎用経路のみ。`command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
+| 既知 provider route のリクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | `command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
+| envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
 | generic `/upstream/*` の upstream 3xx | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
@@ -317,8 +327,10 @@ error shape を使用する。`/v1/chat/completions` は OpenAI shape
 `/v1/messages` は Anthropic shape
 `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`
 とする。どちらも secret、credential、request body の内容を含めず、upstream fetch
-を実行しない。provider preset を追加する場合は、その provider の error envelope を
-定義してから有効化し、universal な `{"error":"invalid_json_body"}` は返さない。
+を実行しない。provider preset を追加する場合は、その provider の route-specific error
+envelope を定義してから provider-compatible route として有効化する。envelope 未定義の
+route/method は JSON parse せず body を raw forward し、universal な
+`{"error":"invalid_json_body"}` は返さない。
 
 既存 `/v1/responses` の upstream 3xx は後方互換のため、従来どおり status、サニタイズ
 後の headers（`Location` を含む）、body を pass-through する。上記の `502` 契約は
@@ -386,8 +398,8 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 以下をカバーする単体テストを作成する。OpenAI と Anthropic の schema member は、
 route/request shape を混同しない別ケースとして扱う。
 
-- `/v1/chat/completions` の `tools[].function.parameters` と `/v1/messages` の `tools[].input_schema` について、互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
-- Anthropic `input_schema.anyOf` の flatten、`type` / `properties` 欠落の補完、および既に有効な `input_schema` の無改変
+- `/v1/chat/completions` の `tools[].function.parameters` について、互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
+- `/v1/messages` の `tools[].input_schema.anyOf` は flatten せず、root `anyOf` がある場合は `type` / `properties` 欠落の補完も含めて byte-for-byte 無改変とする。root `anyOf` がない場合の補完と、既に有効な `input_schema` の無改変
 - OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を含む body を受けた場合に、誤って正規化しないこと
 - 条件を満たさない root `anyOf` は、`type` / `properties` 補完を含む対象 schema の normalization 全体を skip し、対象 schema の UTF-8 byte span が完全一致することを検証する。対象 schema だけを含む fixture では request body bytes 全体も完全一致させ、複数 tool の fixture では安全な別 schema の独立した正規化を妨げないことも確認する。mixed `string | object`、branch-level `required` / `additionalProperties` 等、root-level の object 制約、および explicit な root `type` があるケースを含める
 - `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
@@ -438,11 +450,12 @@ route/request shape を混同しない別ケースとして扱う。
   - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
   - `X-Relay-Authorization` は upstream に届かない
 - POST `/upstream/command-code/v1/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で `tools[].function.parameters` の正規化が行われること
-- POST `/upstream/command-code/v1/messages` において、Anthropic tool の `tools[].input_schema` が同じ安全条件・lossless 条件で正規化されること
+- POST `/upstream/command-code/v1/messages` において、Anthropic tool の `tools[].input_schema` の root `anyOf` が flatten されず、root `anyOf` がある場合は補完を含む対象 schema 全体が byte-for-byte 保持されること
 - POST `/upstream/command-code/v1/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、OpenAI-compatible error envelope `{"error":{"message":"Invalid JSON request body","type":"invalid_request_error","param":null,"code":null}}`、upstream fetch call count `0` となること
 - POST `/upstream/command-code/v1/messages` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、Anthropic-compatible error envelope `{"type":"error","error":{"type":"invalid_request_error","message":"Invalid JSON request body"}}`、upstream fetch call count `0` となること
 - `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は route に対応する同じ provider-compatible envelope となり、upstream fetch call count が `0` であること
 - POST + `application/json` の空 body（body なしを含む）は、route に対応する provider-compatible `400` envelope とし、upstream fetch call count が `0` であること
+- provider-compatible envelope が未定義の `/upstream/command-code/v1/unknown` では malformed JSON を relay が parse せず、body を raw forward すること
 - `text/plain` または不正な `Content-Type` では tools 正規化のための JSON パースを行わないこと
 - GET `/upstream/command-code/v1/models` では body を JSON パースせず、そのまま転送されること
 - HTTP method のそのまま転送（例: GET, POST）
