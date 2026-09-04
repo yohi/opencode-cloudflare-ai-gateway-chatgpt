@@ -73,15 +73,16 @@
 
 ### 3.2 リクエストサニタイズ機能（スキーマ正規化パイプライン）
 - **Tool Schema Normalization（ツール定義の正規化）**:
-  - 対象: `application/json` かつ `body.tools` が配列の場合。
+  - 対象: `Content-Type` を HTTP media type として解釈した type/subtype が `application/json`（パラメータ付き表記および type/subtype の大文字小文字違いを含む）かつ `body.tools` が配列の場合。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
     - `parameters.anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
       2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
       3. 異なる branch 間で同名の property key が存在しないこと。
       4. 各 branch の property の型・制約が互換であること。
+      5. `parameters` ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
     - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンスが invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。
-    - 上記条件を満たさない `anyOf` は、そのまま残すか、非対応として変換前のリクエストを拒否する。後勝ちマージによる silent semantic corruption は許容しない。
+    - 上記条件を満たさない `anyOf` は、そのまま残すか、非対応として変換前のリクエストを拒否する。後勝ちマージによる silent semantic corruption は許容しない。特に root と branch の object 制約を含むスキーマは、変換前後で評価範囲が変わり得るため flatten しない。
   - **`type: "object"` の強制保証**:
     - `parameters.type` が未定義、あるいは空オブジェクト `{}` の場合、必ず `"type": "object"` を付与する。
   - **空 properties の健全化**:

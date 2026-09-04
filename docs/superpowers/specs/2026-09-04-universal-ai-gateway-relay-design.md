@@ -144,7 +144,7 @@ apps/deno-relay/
 ### 5.1 適用条件
 
 - HTTP method が POST であること
-- `Content-Type` が `application/json` であること
+- `Content-Type` を HTTP media type として解釈した type/subtype が `application/json` であること（パラメータ付き表記を許容し、type/subtype は大文字小文字非依存で比較する）
 - ボディが JSON としてパース可能であること
 - `body.tools` が配列であること
 
@@ -158,7 +158,8 @@ apps/deno-relay/
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
      4. 各 branch の property の型・制約が互換であること。
-   - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
+     5. `parameters` ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
+   - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。root と branch の object 制約が相互作用する場合を含め、条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
 
 2. **`type: "object"` の保証**
    - `parameters.type` が未定義、空文字、または空オブジェクト `{}` の場合：
@@ -173,7 +174,7 @@ apps/deno-relay/
 4. **その他フィールド**
    - `description` 等、`tools` 以外のフィールドには一切触れない。
    - `messages` 等、巨大なフィールドには一切触れない。
-   - `required`、`additionalProperties` は、正規化前の値を保持する（anyOf flatten 適用外の場合）。
+   - `required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` は、正規化前の値を保持する（anyOf flatten 適用外の場合）。
 
 ### 5.3 正規化例
 
@@ -270,10 +271,11 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
 
 以下をカバーする単体テストを作成する。
 
-- 互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、すべての branch が `type: "object"`）
+- 互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
 - `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
 - 同名 property が異なる type を持つ場合は変換しない
 - `additionalProperties: false` を含む場合は変換しない
+- root の `properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等が `anyOf` と同じ schema object にある場合は変換しない
 - `enum` / `const` 等の制約を含む場合は変換しない
 - 条件を満たさない `anyOf` を持つスキーマが、silent semantic corruption なく無改変で通過すること
 - **変換前後の validation 結果比較**: 5.3 の例に対し、変換前は valid だが変換後は invalid となるインスタンス（例: `{"query": 123, "limit": 1}`）を含め、flatten が OR を AND 的制約に置き換えることを検証する
@@ -298,7 +300,8 @@ upstream URL は `base URL + path suffix` で構築する。`command-code` の b
   - URL === `https://api.commandcode.ai/provider/v1/models`
   - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
   - `X-Relay-Authorization` は upstream に届かない
-- POST `/upstream/command-code/chat/completions` において、`Content-Type: application/json` なら body を JSON パースし tools 正規化が行われること
+- POST `/upstream/command-code/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら body を JSON パースし tools 正規化が行われること
+- `text/plain` または不正な `Content-Type` では tools 正規化のための JSON パースを行わないこと
 - GET `/upstream/command-code/models` では body を JSON パースせず、そのまま転送されること
 - HTTP method のそのまま転送（例: GET, POST）
 - query string の保持
