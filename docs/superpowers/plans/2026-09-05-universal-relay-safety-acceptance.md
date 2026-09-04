@@ -4,7 +4,7 @@
 
 **Goal:** Resolve the validated body-size and provider-validation acceptance findings without changing the existing legacy relay runtime.
 
-**Architecture:** Keep the current design-only scope for the future generic relay, but make its normalization memory contract executable by a future implementation: a fixed 4 MiB maximum normalized request body, early `Content-Length` rejection, and counted streaming reads for unknown lengths. Extend the existing protected acceptance test to send concrete OpenAI and Anthropic root-`anyOf` fixtures through the Cloudflare AI Gateway Custom Provider and require the workflow to fail when protected configuration is missing.
+**Architecture:** Keep the current design-only scope for the future generic relay, but make its normalization memory contract executable by a future implementation: a fixed 4 MiB maximum normalized request body, early `Content-Length` rejection, and counted streaming reads for every recognized body. Extend the existing protected acceptance test to send concrete OpenAI and Anthropic root-`anyOf` fixtures through the Cloudflare AI Gateway Custom Provider and require the workflow to fail when protected configuration is missing.
 
 **Tech Stack:** Deno standard APIs, Deno tests, GitHub Actions, Japanese Markdown requirements and design documents.
 
@@ -12,7 +12,7 @@
 
 - Preserve the existing legacy `POST /v1/responses` contract, including request-body streaming and redirect pass-through.
 - Apply normalization only to provider-compatible `POST` routes with the matching `application/json` media type.
-- Reject an oversized recognized normalization request before upstream fetch; never raw-forward a partial or unbounded normalized body.
+- Reject an oversized recognized normalization request before upstream fetch; count every recognized body, cancel at the first exceeding chunk, and never raw-forward a partial or unbounded normalized body.
 - Keep generic relay behavior fail-closed and avoid direct ChatGPT fallbacks, retry loops, caching, and payload persistence.
 - Keep `apps/deno-relay` free of runtime dependencies.
 - Keep credentials and provider response bodies out of workflow logs and test failure messages.
@@ -34,7 +34,7 @@
 
 - [x] **Step 1: Add the explicit limit and rejection behavior**
 
-  Document that only recognized provider-compatible JSON routes are bounded. A known `Content-Length` greater than `4 * 1024 * 1024` must return status `413`, `Content-Type: application/json`, and the route-specific envelope before upstream fetch:
+  Document that only recognized provider-compatible JSON routes are bounded. A known `Content-Length` greater than `4 * 1024 * 1024` must return status `413`, `Content-Type: application/json`, and the route-specific envelope before upstream fetch. `Content-Length` is only an early-rejection signal; every other recognized body must still be consumed through a byte-counting reader:
 
   ```json
   {"error":{"message":"Request body exceeds maximum normalization size","type":"invalid_request_error","param":null,"code":"request_body_too_large"}}
@@ -44,13 +44,13 @@
   {"type":"error","error":{"type":"invalid_request_error","message":"Request body exceeds maximum normalization size"}}
   ```
 
-- [x] **Step 2: Define unknown-length handling**
+- [x] **Step 2: Define counted handling for every recognized body**
 
-  Require a counted `ReadableStream` read when `Content-Length` is absent or invalid. Accumulate no more than the limit, cancel the inbound reader as soon as the next chunk would exceed it, return the same `413` envelope, and never call upstream. Preserve raw streaming for legacy, unknown routes, methods, and routes without a normalization policy.
+  Require a counted `ReadableStream` read for every recognized body, including bodies whose valid `Content-Length` is at or below the limit. Accumulate no more than the limit, cancel the inbound reader as soon as the next chunk would exceed it, return the same `413` envelope, and never call upstream. Preserve raw streaming for legacy, unknown routes, methods, and routes without a normalization policy.
 
 - [x] **Step 3: Add regression cases to the documented test strategy**
 
-  Require tests for exactly `4 MiB`, `4 MiB + 1` with `Content-Length`, `4 MiB + 1` without `Content-Length`, malformed/duplicate length fallback to counted reading, upstream fetch count `0` on rejection, and unchanged legacy streaming.
+  Require tests for exactly `4 MiB`, `4 MiB + 1` with `Content-Length`, `4 MiB + 1` without `Content-Length`, an underestimated `Content-Length` whose actual body exceeds `4 MiB`, malformed/duplicate length fallback to counted reading, upstream fetch count `0` on rejection, and unchanged legacy streaming.
 
 - [x] **Step 4: Review wording consistency**
 
@@ -71,13 +71,13 @@
 
 - [x] **Step 1: Write the concrete acceptance fixtures**
 
-  Use the exact safe OpenAI fixture with two disjoint object branches:
+  Use the exact property-only OpenAI fixture with two object branches that have distinct property names:
 
   ```json
   {"anyOf":[{"type":"object","properties":{"query":{"type":"string"}}},{"type":"object","properties":{"limit":{"type":"integer"}}}]}
   ```
 
-  Place it under `tools[].function.parameters` for `/v1/chat/completions` and under `tools[].input_schema` for `/v1/messages`. Keep the Anthropic root `anyOf` unchanged by asserting only a successful provider response, not a locally rewritten body.
+  Place it under `tools[].function.parameters` for `/v1/chat/completions` and under `tools[].input_schema` for `/v1/messages`. The fixture intentionally matches the OpenAI property-only flatten contract; it is not claimed to be mutually exclusive at the JSON Schema level. Protected acceptance proves provider request acceptance. Preservation of the Anthropic root `anyOf` requires downstream payload capture or relay integration coverage, not a 2xx response alone.
 
 - [x] **Step 2: Add protected tests**
 

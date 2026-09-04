@@ -178,11 +178,11 @@ apps/deno-relay/
 - body byte size が `MAX_NORMALIZATION_BODY_BYTES = 4 * 1024 * 1024`（4 MiB）以下であること。これは
   platform limit ではなく、認識済み normalization route のアプリケーションメモリ予算であり、
   運用環境の環境変数で引き上げてはならない。単一の正しい decimal `Content-Length` が上限を
-  超える場合は body を読み切らず `413` を返す。`Content-Length` が欠落、不正、または複数値で
-  解釈できない場合は inbound `ReadableStream` を byte counter 付きで読み、上限を超える次の
-  chunk を検出した時点で reader を cancel し、部分 body を upstream へ渡さない。上限ちょうど
-  は許可し、`4 MiB + 1` byte は拒否する。実 body と `Content-Length` が異なる場合は byte counter
-  の結果を正とする。
+  超える場合だけ、body を読み切らず `413` を返す。その他の認識済み body は、
+  `Content-Length` の有無・妥当性にかかわらず inbound `ReadableStream` を byte counter 付きで
+  読み、実際の累計が上限を超える次の chunk を検出した時点で reader を cancel し、部分 body を
+  upstream へ渡さない。上限ちょうどは許可し、`4 MiB + 1` byte は拒否する。実 body の byte
+  counter の結果を常に正とし、`Content-Length` は超過の早期拒否にだけ使用する。
 
 route pathname を API request shape の主な識別子とし、対象 schema member は次のように
 固定する。
@@ -223,7 +223,8 @@ failure は provider-compatible envelope が定義された既知 route にだ�
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
      4. 各 branch の property の型・制約が互換であること。
-     5. 対象 schema ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
+     5. 対象 schema ルートの `type` が未定義または `"object"` であること。`"string"`、`"array"`、複合型の配列など、それ以外の値では flatten しないこと。
+     6. 対象 schema ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
    - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。root と branch の object 制約が相互作用する場合を含め、条件を満たさない `anyOf` は flatten せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
    - flatten を実施しないと決定した場合は、その対象 schema を **normalization skip** とし、後続の `type: "object"` / `properties: {}` 補完を含む対象 schema 全体の正規化を行わない。`anyOf`、その branch、schema 内の全 member、および対応する request body byte span は入力のまま保持する。flatten に成功した場合、または root `anyOf` が存在しない場合に限り、後続の `type` / `properties` 補完を適用できる。
    - 例えば、root `type` のない `{ "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "query": { "type": "string" } } }] }` は flatten 不可である。ここに root `type: "object"` を追加すると元の string branch を無効化するため、`type` / `properties` を追加せず完全に無改変とする。
@@ -462,9 +463,12 @@ route/request shape を混同しない別ケースとして扱う。
 - 正規化対象 body の `MAX_NORMALIZATION_BODY_BYTES` が `4 * 1024 * 1024` bytes で固定され、
   body が上限ちょうどなら許可され、`4 MiB + 1` byte は `Content-Length` の事前判定で
   `413` となること。上限超過時の upstream fetch call count は `0` であること
-- `Content-Length` が欠落、不正、または複数値の body は counted reader で検査し、上限を
-  超える次の chunk で reader を cancel して同じ `413` envelope を返すこと。部分 bodyを
-  upstream へ送らず、secret、credential、body 内容を error response に含めないこと
+- 単一の正しい `Content-Length` が上限以下でも、実 body は counted reader で検査し、実際の
+  byte counter が上限を超える次の chunk で reader を cancel すること。欠落、不正、複数値の
+  `Content-Length` も同じ counted reader を使うこと。部分 bodyを upstream へ送らず、secret、
+  credential、body 内容を error response に含めないこと
+- root `type` が `"string"`、`"array"`、または複合型の配列である anyOf は flatten と補完を
+  行わず、対象 schema を byte-for-byte 保持すること
 
 ### 9.2 relay_test.ts（既存を拡張）
 
@@ -549,12 +553,14 @@ route/request shape を混同しない別ケースとして扱う。
   acceptance は別のテスト群として実装する。後者は実 Cloudflare AI Gateway Custom
   Provider、実 Deno Deploy relay、実 Command Code Provider API を通る手動 workflow
   でのみ実行し、mock の統合テストを代替証拠としない。
-- OpenAI の具体的な safe root `anyOf` fixture
+- OpenAI の具体的な property-only root `anyOf` fixture
   `{"anyOf":[{"type":"object","properties":{"query":{"type":"string"}}},{"type":"object","properties":{"limit":{"type":"integer"}}}]}`
   を `tools[].function.parameters` に設定した request を Gateway へ送り、Command Code
   の実 provider validator を通過して成功することを確認する。Anthropic では同じ fixture
-  を `tools[].input_schema` に設定し、`/v1/messages` の root `anyOf` を保持したまま
-  成功することを確認する。mock のみでこの判定を代替してはならない。
+  を `tools[].input_schema` に設定し、`/v1/messages` が provider に受け入れられることを
+  確認する。実際に relay が転送した body の root `anyOf` が保持されたことの証拠には、
+  downstream payload capture または relay の統合テストを用い、2xx response だけで保持を
+  推論してはならない。mock のみで provider acceptance 判定を代替してはならない。
 - 汎用 acceptance は、OpenAI の
   `.../custom-command-code/v1/chat/completions`、Anthropic の
   `.../custom-command-code/v1/messages`、両 SDK の `/v1/models` に対応する request

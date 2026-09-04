@@ -169,12 +169,12 @@
       リクエストで使用できるアプリケーションメモリを制限するための契約である。
       運用環境の環境変数で上限を引き上げてはならない。
     - provider-compatible route として定義された `POST`、かつ `application/json`
-      の route では、単一の正しい decimal `Content-Length` が
-      上限を超える場合、body を読み切らずに status `413` を返し、upstream fetch
-      を 実行しない。`Content-Length`
-      が欠落、不正、または複数値で解釈できない場合は、 inbound `ReadableStream`
-      を byte counter 付きで読み、累計が上限を超える次の chunk を検出した時点で
-      reader を cancel する。上限を超えた body の部分データを upstream
+      の route では、単一の正しい decimal `Content-Length`
+      が上限を超える場合だけ body を読み切らずに status `413` を返し、upstream
+      fetch を実行しない。 その他の body は `Content-Length`
+      の有無・妥当性にかかわらず inbound `ReadableStream` を byte counter
+      付きで読み、実際の累計が上限を超える次の chunk を検出した時点で reader を
+      cancel する。上限を超えた body の部分データを upstream
       へ送ってはならない。
     - 上限超過時の response は `Content-Type: application/json` とし、
       `/v1/chat/completions` では
@@ -182,10 +182,10 @@
       `/v1/messages` では
       `{"type":"error","error":{"type":"invalid_request_error","message":"Request body exceeds maximum normalization size"}}`
       を返す。secret、credential、body 内容を含めてはならない。
-    - body が上限以下の場合だけ、受信済み bytes を lossless scanner/transform
-      に渡す。 上限ちょうどの body は許可し、`4 MiB + 1` byte は拒否する。実
-      body の長さが `Content-Length` と異なる場合も byte counter
-      の結果を正とする。
+    - counted reader が上限以下で完了した body だけを lossless scanner/transform
+      に渡す。 上限ちょうどの body は許可し、`4 MiB + 1` byte
+      は拒否する。`Content-Length` は 上限超過の早期拒否にだけ使用し、実 body の
+      byte counter の結果を常に正とする。
     - 未知 route、未知 method、または normalization policy が未定義の route は、
       JSON parse とこの body 上限の対象にせず、既存契約どおり raw forward する。
       既存 `/v1/responses` は常に body を streaming のまま転送する。
@@ -234,7 +234,10 @@
          以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
       3. 異なる branch 間で同名の property key が存在しないこと。
       4. 各 branch の property の型・制約が互換であること。
-      5. 対象 schema ルートに、branch の評価と相互作用する object
+      5. 対象 schema ルートの `type` が未定義または `"object"` であること。
+         `"string"`、`"array"`、複合型の配列など、それ以外の値では flatten
+         しないこと。
+      6. 対象 schema ルートに、branch の評価と相互作用する object
          制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties`
          等）が存在しないこと。
     - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により
@@ -500,8 +503,10 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
   を `tools[].function.parameters` に設定した request を送信し、OpenAI provider
   validator を通過して成功すること。fixture は mock のみに送信してはならない。
 - Anthropic の同じ root `anyOf` fixture を `tools[].input_schema` に設定した
-  request を送信し、`/v1/messages` の root `anyOf`
-  が保持された状態で成功すること。
+  request を送信し、`/v1/messages` が provider に受け入れられること。2xx
+  response だけでは relay 転送後の root `anyOf`
+  保持を証明できないため、保持の検証は downstream payload capture または relay
+  の統合テストで行うこと。
 - OpenAI SDK 相当の `POST .../custom-command-code/v1/chat/completions` が relay
   の `/upstream/command-code/v1/chat/completions` を経由して成功すること。
   - Anthropic SDK 相当の `POST .../custom-command-code/v1/messages` が relay の

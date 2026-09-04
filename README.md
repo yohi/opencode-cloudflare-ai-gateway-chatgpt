@@ -146,11 +146,11 @@ span を入力のまま保持します。OpenAI route で flatten できない `
 
 認識済み provider-compatible JSON route の正規化 body には、
 `MAX_NORMALIZATION_BODY_BYTES = 4 * 1024 * 1024`（4 MiB）の固定上限があります。
-正しい `Content-Length` が上限を超える場合は body を読み切らず、欠落・不正・複数値の
-`Content-Length` では counted reader が上限超過を検出した時点で reader を cancel し、
-route-specific な `413` JSON error を返します。部分 body を upstream へ送ることは
-ありません。legacy `/v1/responses`、未知 route/method、normalization policy 未定義の
-route はこの buffering 上限の対象外で、従来どおり raw streaming されます。
+正しい `Content-Length` が上限を超える場合だけ body を読み切らず、その他の認識済み body は
+`Content-Length` の有無・妥当性にかかわらず counted reader で読みます。実 body が上限を
+超えた時点で reader を cancel し、route-specific な `413` JSON error を返します。部分 body
+を upstream へ送ることはありません。legacy `/v1/responses`、未知 route/method、normalization
+policy 未定義の route はこの buffering 上限の対象外で、従来どおり raw streaming されます。
 
 provider preset が malformed JSON の envelope を定義した既知 route では、`POST` かつ
 `Content-Type` の media type が `application/json` の body を解析できない場合、route-specific
@@ -195,12 +195,14 @@ acceptance を手動実行します。必須値は次のとおりです。
 - `RELAY_ACCEPTANCE_GATEWAY_TOKEN`: Gateway token secret
 - `RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`: Command Code API key secret
 
-acceptance は `tools[].function.parameters` に次の safe root `anyOf` を含む OpenAI
+acceptance は `tools[].function.parameters` に次の property-only root `anyOf` を含む OpenAI
 `/v1/chat/completions` request と、同じ schema を `tools[].input_schema` に含む Anthropic
-`/v1/messages` request を実providerへ送信します。OpenAI route は validator を通過し、
-Anthropic route は root `anyOf` を保持したまま成功することを確認します。両 route の
-malformed/empty JSON envelope、`/v1/models`、path mapping、credential separation も
-確認します。必要な変数またはsecretが未設定の場合、workflowはskipせず失敗します。
+`/v1/messages` request を実providerへ送信します。OpenAI route と Anthropic route が
+providerに受け入れられることを確認します。Anthropic root `anyOf` がrelay転送後も保持
+されたことは2xx responseだけでは証明できないため、downstream payload captureまたは
+relay統合テストで検証します。両 route の malformed/empty JSON envelope、`/v1/models`、
+path mapping、credential separation も確認します。必要な変数またはsecretが未設定の場合、
+workflowはskipせず失敗します。
 
 ## サポート対象バージョンとフェイルクローズ
 
