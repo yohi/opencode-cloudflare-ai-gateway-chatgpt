@@ -163,6 +163,10 @@ apps/deno-relay/
   のいずれであっても拒否する。`307` / `308` でも、元の POST body は最初の upstream
   request に 1 回だけ送られ、relay は redirect 先へ再送しない。
 - SSE 応答の場合、120 秒のアイドルタイムアウトを適用
+- upstream fetch の header timeout は応答ヘッダー受信時に停止し、SSE idle timeout は
+  その時点から開始して各 body chunk の受信ごとにリセットする。header timeout が
+  進行中の SSE stream を終了させてはならず、client abort signal は両 timer から独立して
+  upstream fetch と response body へ伝播する。
 - クライアント切断時に upstream fetch および response body を abort
 
 ## 5. Tools スキーマ正規化
@@ -235,7 +239,8 @@ failure は provider-compatible envelope が定義された既知 route にだ�
 
 3. **`type: "object"` の保証**
    - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が空オブジェクト、もしくは `type` member が未定義/空文字列の場合：
-      - `"type": "object"` を付与する
+      - `type` member が空文字列なら、その value span を `"object"` に置換する
+      - `type` member が未定義なら `"type": "object"` を追加する
    - それ以外の既存 `type` は変更しない
    - flatten 不可として normalization skip になった対象 schema には、この補完を適用しない。
 
@@ -367,7 +372,9 @@ route/method は JSON parse せず body を raw forward し、universal な
 | `SSE_IDLE_TIMEOUT_MS` | - | SSE アイドルタイムアウト（整数 milliseconds、`1` 以上 `3_600_000` 以下） | 120000 |
 
 `config.ts` の pure config loader は startup 時に両 timeout を parse する。環境変数が
-`undefined` の場合だけ既定値を使用し、空文字列は未設定とはみなさない。前後の ASCII
+`undefined` の場合だけ既定値を使用し、空文字列は未設定とはみなさない。`RELAY_SECRET`
+は `undefined`、空文字列、または ASCII whitespace のみの値を設定エラーとする。存在確認
+では前後の whitespace を trim するが、有効な secret の値自体は暗黙に変更しない。前後の ASCII
 whitespace を除去した値が `[1-9][0-9]*` に一致し、`1` 以上 `3_600_000` 以下の
 finite integer milliseconds であることを要求する。`0`、負数、符号付き表記、小数、
 `30s` 等の非数値、`NaN`、`Infinity`、上限超過値は設定エラーとする。
@@ -413,6 +420,7 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - **基盤プラットフォーム**: Deno Deploy
 - **処理場所と CPU リスクの分離**: 大容量リクエストの JSON scan/transform は Deno Deploy relay で実行し、Cloudflare Workers Free の 10ms CPU 制限を relay の処理に持ち込まないこと。Deno Deploy の CPU 無制限を前提にせず、対象 plan/runtime の計測値と SLO で受け入れ判定する
 - **メモリ予算**: 1 リクエストの process/heap high-water を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno Deploy 共通の platform limit とは仮定しない
+- **正規化の同時実行制御**: 正規化対象 body の in-flight 数を有限の admission control で制限し、body buffering、scan state、patch assembly を含む aggregate process/heap high-water が target runtime の予算内に収まる最大同時実行数を固定すること。上限到達時は新しい body の buffering を開始せず、明示した overload response で fail-closed に拒否すること
 - **正規化 body のアプリケーション上限**: 認識済み provider-compatible JSON route の
   `MAX_NORMALIZATION_BODY_BYTES` を 4 MiB に固定する。4 MiB 以下での buffering、scan、patch
   assembly の process/heap high-water を target runtime で計測し、512 MB の保守的予算に対する
@@ -420,6 +428,7 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - **ゼロ外部依存**: Deno 標準 API のみで実装する
 - **レイテンシオーバーヘッド SLO（初期値）**: 受信済み body bytes の scan/transform 開始から、upstream fetch を開始できる request body と header の準備完了までを計測区間とする。network 転送、upstream 待ち時間、cold start は含めない
 - **SLO の測定条件**: body size 700 KiB、1 MiB、2 MiB、4 MiB、warm な Deno Deploy instance、単一同時実行で p95 を測定する。JSON scan/transform と header 処理を合わせた p95 は各サイズで 10ms 未満を初期目標とする。これは Cloudflare または Deno Deploy の platform limit ではなく、測定可能な product SLO である
+- **同時実行 benchmark**: 4 MiB body で、少なくとも最大同時実行数まで並列に body、scan state、patch assembly を保持する条件を測定し、concurrency、aggregate process/heap high-water、admission control による拒否数を記録する。1 リクエストの 512 MB 予算だけで同時実行時の安全性を判定してはならない
 - **benchmark の記録**: p50/p95/p99、body size、runtime/version、region、warm/cold 条件、concurrency、および process/heap high-water を記録する。SLO 判定は target Deno Deploy 環境で行い、ローカル実行結果だけで合否を決めない
 - **ステートレス設計**: DB や永続状態を持たない
 - **ログ**: 可観測性は Cloudflare AI Gateway に一元委託し、リレー側では機密ペイロードのログ出力を最小限に抑える
@@ -443,7 +452,8 @@ route/request shape を混同しない別ケースとして扱う。
 - 条件を満たさない root `anyOf` を持つ対象 schema が、`type` / `properties` 補完を含む normalization 全体を skip し、対象 schema の byte span を変更せず silent semantic corruption なく通過すること
 - **変換前後の validation 結果比較**: 5.3 の例に対し、変換前は valid だが変換後は invalid となるインスタンス（例: `{"query": 123, "limit": 1}`）を含め、flatten が OR を AND 的制約に置き換えることを検証する
 - 5.3 に掲載された anyOf 例そのものをテストケース化し、入力・出力ともに期待通りであること
-- `type` の補完（root `anyOf` なし、未定義 / 空文字列 / 空 schema object）を OpenAI / Anthropic の双方で検証
+- `type` の補完（root `anyOf` なし、未定義 / 空文字列 / 空 schema object）を OpenAI / Anthropic の双方で検証し、空文字列では既存の `type` member が 1 つだけ残って `"object"` になることを確認
+- root `type` が `"string"`、`"array"`、または複合型の配列の場合、anyOf の flatten と補完を行わず byte-for-byte 保持することを検証
 - 空 `properties` の補完（root `anyOf` なし）を OpenAI / Anthropic の双方で検証
 - 引数なしツールの正規化
 - 既存の正しい schema は OpenAI / Anthropic の双方で無改変
@@ -572,8 +582,10 @@ route/request shape を混同しない別ケースとして扱う。
   その serialization と secret forwarding を説明していないため、設定が実際に
   機能することを acceptance の必須条件とする。
 - Gateway base URL、Gateway token、Command Code API key は protected Environment の
-  variables/secrets から注入し、workflow のログへ出力しない。必須値が欠落した場合は
-  skip せず release gate を fail させる。
+  variables/secrets から注入し、workflow のログへ出力しない。`RELAY_SECRET` は test
+  runner に注入せず、Cloudflare Custom Provider の protected header 設定だけに保存する。
+  generic acceptance が relay 経由で成功することを `RELAY_SECRET` の存在確認とし、relay
+  が `401` を返す場合は release gate を fail させる。必須値が欠落した場合は skip しない。
 - test runner の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
   `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、`RELAY_ACCEPTANCE_MODEL`、
   `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY` とする。

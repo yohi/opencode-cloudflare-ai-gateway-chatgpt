@@ -53,7 +53,7 @@ Deno.test(
           rejected = error instanceof Error &&
             error.message === "invalid protected acceptance Gateway URL";
         }
-        assert(rejected, `accepted invalid Gateway URL: ${gatewayBaseUrl}`);
+        assert(rejected, "accepted an invalid Gateway URL");
       }
     } finally {
       globalThis.fetch = originalFetch;

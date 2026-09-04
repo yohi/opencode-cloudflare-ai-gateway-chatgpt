@@ -270,7 +270,9 @@
   - **`type: "object"` の強制保証**:
     - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が
       空オブジェクト、もしくは `type` member が未定義/空文字列の場合、
-      `"type": "object"` を付与する。それ以外の既存 `type` は変更しない。
+      `"type": "object"` を保証する。`type` member が存在し空文字列の場合はその
+      value span を `"object"` に置換し、未定義の場合だけ新しい member
+      を追加する。 それ以外の既存 `type` は変更しない。
     - flatten 不可として normalization skip になった対象 schema には、この補完を
       適用しない。
   - **空 properties の健全化**:
@@ -332,6 +334,11 @@
   - **上流接続タイムアウト**: 既定 30 秒（ヘッダー応答待ち）。
   - **SSE アイドルタイムアウト**: 既定 120
     秒（ストリーム無通信検知で自動切断）。
+  - 上流接続タイムアウトは応答ヘッダー受信時に停止し、SSE アイドルタイムアウトは
+    その時点から開始して各 body chunk
+    の受信ごとにリセットする。上流接続タイムアウト が進行中の SSE stream
+    を終了させてはならず、client abort は両 timer から独立して upstream fetch と
+    response body に伝播する。
   - **クライアント切断検知**: クライアントが通信を切断（Abort）した場合、上流の
     fetch リクエストも即座に abort し、無駄なトークン消費・リソース浪費を防ぐ。
 
@@ -350,6 +357,12 @@
   を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime
   の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno
   Deploy 共通の platform limit とは仮定しない。
+- **正規化の同時実行制御**: 正規化対象 body の in-flight 数を有限の admission
+  control で制限し、最大同時実行数と、body buffering・scan state・patch assembly
+  を含む aggregate process/heap high-water が target runtime
+  の予算内に収まる値を 実装・運用設定として固定すること。上限到達時は新しい body
+  の buffering を開始せず、 明示した overload response で fail-closed
+  に拒否すること。
 - **正規化 body のアプリケーション上限**: `MAX_NORMALIZATION_BODY_BYTES` を
   `4 * 1024 * 1024`（4 MiB）の固定値とし、認識済み provider-compatible JSON
   route の body buffering、scan、patch assembly
@@ -371,9 +384,12 @@
   - JSON scan/transform と header 処理を合わせた p95 は各サイズで 10ms
     未満を初期目標とする。これは Cloudflare または Deno Deploy の platform limit
     ではなく、測定可能な product SLO である。
-  - benchmark は p50/p95/p99、body size、runtime/version、region、warm/cold
-    条件、concurrency、および process/heap high-water を記録する。SLO 判定は
-    target Deno Deploy 環境で行い、ローカル実行結果だけで合否を決めない。
+- benchmark は p50/p95/p99、body size、runtime/version、region、warm/cold
+  条件、concurrency、および process/heap high-water を記録する。SLO 判定は
+  target Deno Deploy 環境で行い、ローカル実行結果だけで合否を決めない。
+- 4 MiB body を最大同時実行数まで並列に処理する benchmark では、aggregate
+  process/heap high-water、admission control による拒否数、実際の in-flight 数を
+  記録し、単一リクエストの512 MB予算だけで安全性を判定しない。
 
 ### 4.3 信頼性・観測性
 
@@ -412,6 +428,11 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
 受け取った milliseconds をそのまま使用し、production の env 値が header timeout
 と SSE idle timeout の各処理へ到達することを検証可能にする。`RELAY_SECRET`
 が未設定の場合の既存の `503` 契約は変更しない。
+
+`RELAY_SECRET` は `undefined`、空文字列、または ASCII whitespace
+のみの値を設定エラー として扱い、`Deno.serve` を開始しない。存在確認では前後の
+whitespace を trim するが、 有効な secret
+の値自体を暗黙に変更せず、診断には値を出力しない。
 
 `MAX_NORMALIZATION_BODY_BYTES` は環境変数ではなく、`4 * 1024 * 1024`（4 MiB）の
 固定実装値とする。正規化対象 route の body
@@ -464,6 +485,13 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
   `string | object`、branch-level `required` / `additionalProperties` 等、
   root-level の object 制約、および explicit な root `type`
   があるケースを含める。
+- 空文字列の `type` member は既存 value span を `"object"` に置換し、`type`
+  member が1つだけ残ることを検証する。root `type` が
+  `"string"`、`"array"`、または複合型の 配列の場合は anyOf の flatten
+  と補完を行わず、対象 schema を byte-for-byte 保持する ことを検証する。
+- 単一の正しい `Content-Length` が上限以下でも実 body
+  が上限を超える場合、counted reader が超過 chunk で cancel し、部分 body
+  を送らず upstream fetch call count が `0` となることを検証する。
 - generic `/upstream/*` の upstream mock が `300`、`301`、`302`、`303`、`305`、
   `306`、`307`、`308`（absolute cross-origin、absolute same-provider、relative
   `Location` と body 付き）を返した場合、`502` の安定したエラーとなり、
@@ -520,10 +548,12 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
     に漏洩しないこと。
   - Cloudflare Gateway log が作成され、provider path mapping
     が期待値と一致すること。
-- acceptance の endpoint、Gateway token、Command Code API key、relay secret は
-  protected Environment の variables/secrets から注入し、workflow
-  のログに出力しない。必須値が未設定の場合は skip せず、release gate を fail
-  させる。
+- acceptance の endpoint、Gateway token、Command Code API key は protected
+  Environment の variables/secrets から test runner に注入し、workflow
+  のログに出力しない。 `RELAY_SECRET` は test runner に注入せず、Cloudflare
+  Custom Provider の protected header 設定だけに保存する。generic acceptance が
+  relay 経由で成功することを `RELAY_SECRET` の存在確認とし、relay が `401`
+  を返す場合は release gate を fail させる。
 - acceptance test の必須値は `RELAY_ACCEPTANCE_ORIGIN`、
   `RELAY_ACCEPTANCE_GATEWAY_BASE_URL`、`RELAY_ACCEPTANCE_MODEL`、
   `RELAY_ACCEPTANCE_GATEWAY_TOKEN`、`RELAY_ACCEPTANCE_COMMAND_CODE_API_KEY`
