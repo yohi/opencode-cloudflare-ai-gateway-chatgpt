@@ -197,23 +197,27 @@ failure だけは 4.1 の汎用経路規約に従う。
   - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
 1. **`anyOf` の互換性変換（意図的な意味の狭め込み）**
-   - 対象 schema の `anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
+   - 対象 schema の root に `anyOf` が存在する場合、以下の条件をすべて満たすときのみ、各 branch の `properties` をルート直下にマージし、`anyOf` キーを削除する。
      1. すべての branch が `type: "object"` を持つこと。
      2. 各 branch が `properties` 以外の制約（`required`、`additionalProperties`、`enum`、`const`、条件付き制約等）を持たないこと。
      3. 異なる branch 間で同名の property key が存在しないこと。
      4. 各 branch の property の型・制約が互換であること。
      5. 対象 schema ルートに、branch の評価と相互作用する object 制約（`properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等）が存在しないこと。
-   - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。root と branch の object 制約が相互作用する場合を含め、条件を満たさない `anyOf` は変換せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
+   - **重要**: JSON Schema の `anyOf` は OR であるため、 flatten により property 間の AND 的制約に置き換わり、元 schema では valid な一部のインスタンス（例: 片方 branch の property 型が不正でも別 branch を満たすインスタンス）が invalid となる。本変換は JSON Schema 上の strict な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の anyOf パターンを対象プロバイダの strict バリデータに通すための互換策である。root と branch の object 制約が相互作用する場合を含め、条件を満たさない `anyOf` は flatten せず、そのまま残す。後勝ちマージによる silent semantic corruption は許容しない。
+   - flatten を実施しないと決定した場合は、その対象 schema を **normalization skip** とし、後続の `type: "object"` / `properties: {}` 補完を含む対象 schema 全体の正規化を行わない。`anyOf`、その branch、schema 内の全 member、および対応する request body byte span は入力のまま保持する。flatten に成功した場合、または root `anyOf` が存在しない場合に限り、後続の `type` / `properties` 補完を適用できる。
+   - 例えば、root `type` のない `{ "anyOf": [{ "type": "string" }, { "type": "object", "properties": { "query": { "type": "string" } } }] }` は flatten 不可である。ここに root `type: "object"` を追加すると元の string branch を無効化するため、`type` / `properties` を追加せず完全に無改変とする。
 
 2. **`type: "object"` の保証**
-   - 対象 schema が空オブジェクト、または `type` member が未定義/空文字列の場合：
-     - `"type": "object"` を付与する
+   - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が空オブジェクト、もしくは `type` member が未定義/空文字列の場合：
+      - `"type": "object"` を付与する
    - それ以外の既存 `type` は変更しない
+   - flatten 不可として normalization skip になった対象 schema には、この補完を適用しない。
 
 3. **空 `properties` の保持**
-   - 対象 schema の `properties` が未定義の場合：
-     - `"properties": {}` を追加する
+   - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema の `properties` が未定義の場合：
+      - `"properties": {}` を追加する
    - 既存の `properties` は保持する
+   - flatten 不可として normalization skip になった対象 schema には、この補完を適用しない。
 
 4. **その他フィールド**
    - `description` 等、`tools` 以外のフィールドには一切触れない。
@@ -376,16 +380,17 @@ route/request shape を混同しない別ケースとして扱う。
 - `/v1/chat/completions` の `tools[].function.parameters` と `/v1/messages` の `tools[].input_schema` について、互換変換対象の `anyOf` のみ flatten（`properties` のみ、同名 key なし、branch-level 制約なし、root-level の相互作用する object 制約なし、すべての branch が `type: "object"`）
 - Anthropic `input_schema.anyOf` の flatten、`type` / `properties` 欠落の補完、および既に有効な `input_schema` の無改変
 - OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を含む body を受けた場合に、誤って正規化しないこと
+- 条件を満たさない root `anyOf` は、`type` / `properties` 補完を含む対象 schema の normalization 全体を skip し、対象 schema の UTF-8 byte span が完全一致することを検証する。対象 schema だけを含む fixture では request body bytes 全体も完全一致させ、複数 tool の fixture では安全な別 schema の独立した正規化を妨げないことも確認する。mixed `string | object`、branch-level `required` / `additionalProperties` 等、root-level の object 制約、および explicit な root `type` があるケースを含める
 - `anyOf` 内の branch ごとに `required` が異なる場合は変換しない
 - 同名 property が異なる type を持つ場合は変換しない
 - `additionalProperties: false` を含む場合は変換しない
 - root の `properties`、`required`、`additionalProperties`、`patternProperties`、`unevaluatedProperties` 等が `anyOf` と同じ schema object にある場合は変換しない
 - `enum` / `const` 等の制約を含む場合は変換しない
-- 条件を満たさない `anyOf` を持つスキーマが、silent semantic corruption なく無改変で通過すること
+- 条件を満たさない root `anyOf` を持つ対象 schema が、`type` / `properties` 補完を含む normalization 全体を skip し、対象 schema の byte span を変更せず silent semantic corruption なく通過すること
 - **変換前後の validation 結果比較**: 5.3 の例に対し、変換前は valid だが変換後は invalid となるインスタンス（例: `{"query": 123, "limit": 1}`）を含め、flatten が OR を AND 的制約に置き換えることを検証する
 - 5.3 に掲載された anyOf 例そのものをテストケース化し、入力・出力ともに期待通りであること
-- `type` の補完（未定義 / 空文字列 / 空 schema object）を OpenAI / Anthropic の双方で検証
-- 空 `properties` の補完を OpenAI / Anthropic の双方で検証
+- `type` の補完（root `anyOf` なし、未定義 / 空文字列 / 空 schema object）を OpenAI / Anthropic の双方で検証
+- 空 `properties` の補完（root `anyOf` なし）を OpenAI / Anthropic の双方で検証
 - 引数なしツールの正規化
 - 既存の正しい schema は OpenAI / Anthropic の双方で無改変
 - `messages`、別フィールド、`messages` 内の無関係な `input_schema` が残ること
@@ -399,7 +404,7 @@ route/request shape を混同しない別ケースとして扱う。
 - top-level/provider field と `messages` 内の `9007199254740993`、および tool schema 内の `9223372036854775807` が丸められず、入力と同じ JSON number token で保持されること
 - `-0`、指数表記、末尾ゼロを含む正規化対象外の number token が変換前後で変更されないこと
 - scanner が valid JSON の token boundary を安全に確定できないと判定したケースでは、部分再シリアライズを行わず、元の body bytes がそのまま upstream に渡されて正規化がスキップされること。判定条件またはテスト用の failure injection を固定し、400 の JSON parse failure と混同しないこと
-- `anyOf` 要素がオブジェクトでない場合は無改変
+- `anyOf` 要素がオブジェクトでない場合は、`type` / `properties` 補完を含め無改変
 - 空 `tools` 配列の場合の無改変
 
 ### 9.2 relay_test.ts（既存を拡張）

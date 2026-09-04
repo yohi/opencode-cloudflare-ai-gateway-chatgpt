@@ -133,6 +133,13 @@ OpenAI の `/v1/chat/completions` では `tools[].function.parameters`、Anthrop
 `/v1/messages` では `tools[].input_schema` のみを対象とし、別の route/request shape
 は変更しません。`messages` 等の対象外フィールドと JSON number token は保持します。
 
+対象 schema の root `anyOf` は、安全条件を満たす場合だけ flatten します。flatten
+できない `anyOf` は残し、`type: "object"` や `properties: {}` の補完を含む対象 schema
+の正規化全体をスキップして、対象 schema の request body byte span を入力のまま保持します。
+同じ body 内にある別の安全な対象 schema の正規化は妨げません。
+root `anyOf` がない場合、または安全な flatten に成功した場合だけ、欠落した `type`
+や `properties` を補完します。
+
 汎用経路の upstream `401`、`403`、`429`、`5xx` および通常の response は pass-through
 します。upstream の 3xx は、absolute cross-origin、absolute same-provider、relative
 な `Location` を問わず `502 {"error":"upstream_redirect_not_allowed"}` に変換し、

@@ -169,7 +169,7 @@
       へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの
       silent data corruption は許容しない。
   - **`anyOf` の互換性変換（意図的な意味の狭め込み）**:
-    - 対象 schema の `anyOf`
+    - 対象 schema の root に `anyOf`
       が存在する場合、以下の条件をすべて満たすときのみ、各 branch の
       `properties` をルート直下にマージし、`anyOf` キーを削除する。
       1. すべての branch が `type: "object"` を持つこと。
@@ -186,17 +186,34 @@
       な意味保存ではなく、MCP サーバー（Greptile 等）が実際に生成する特定の
       anyOf パターンを対象プロバイダの strict
       バリデータに通すための互換策である。
-    - 上記条件を満たさない `anyOf`
-      は、そのまま残すか、非対応として変換前のリクエストを拒否する。後勝ちマージによる
-      silent semantic corruption は許容しない。特に root と branch の object
-      制約を含むスキーマは、変換前後で評価範囲が変わり得るため flatten しない。
+    - 上記条件を満たさない root `anyOf` は flatten
+      せず、そのまま残す。後勝ちマージによる silent semantic corruption
+      は許容しない。特に root と branch の object
+      制約を含むスキーマは、変換前後で 評価範囲が変わり得るため flatten しない。
+    - flatten を実施しないと決定した場合は、その対象 schema を **normalization
+      skip** とし、`type: "object"` や `properties: {}` の補完を含む対象 schema
+      全体の正規化を行わない。`anyOf`、その branch、schema 内の全 member、および
+      対応する request body byte span は入力のまま保持する。flatten
+      に成功した場合、 または root `anyOf` が存在しない場合に限り、後続の `type`
+      / `properties` 補完を適用できる。
+    - 例えば、root `type` のない
+      `{ "anyOf": [{ "type": "string" },
+      { "type": "object", "properties": { "query": { "type": "string" } } }] }`
+      は flatten 不可である。ここに root `type: "object"` を追加すると元の
+      string branch を無効化するため、`type` / `properties`
+      を追加せず完全に無改変とする。
   - **`type: "object"` の強制保証**:
-    - 各対象 schema が空オブジェクト、または `type` member が未定義/空文字列の
-      場合、必ず `"type": "object"` を付与する。それ以外の既存 `type`
-      は変更しない。
+    - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema が
+      空オブジェクト、もしくは `type` member が未定義/空文字列の場合、
+      `"type": "object"` を付与する。それ以外の既存 `type` は変更しない。
+    - flatten 不可として normalization skip になった対象 schema には、この補完を
+      適用しない。
   - **空 properties の健全化**:
-    - 引数のないツールのパラメータ定義であっても、各対象 schema に
-      `"properties": {}` を保持させて厳格バリデータを通過させる。
+    - root `anyOf` が存在しない、または安全な flatten に成功した対象 schema
+      について、 引数のないツールのパラメータ定義であっても `"properties": {}`
+      を保持させて 厳格バリデータを通過させる。
+    - flatten 不可として normalization skip になった対象 schema には、この補完を
+      適用しない。
 - **メッセージ / 引数の破損防止**:
   - `tools` 以外の巨大なフィールド（`messages`
     等）は一切改変せず、raw/token-preserving な body のまま転送する。
@@ -349,6 +366,14 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
   欠落、 既に有効な schema の無変更、`messages` 内や別フィールドの無関係な
   schema の無変更を 検証する。OpenAI route では `function.parameters`、Anthropic
   route では `input_schema` のみが対象となることも検証する。
+- 条件を満たさない root `anyOf` は、`type` / `properties` 補完を含む対象 schema
+  の normalization 全体を skip し、対象 schema の UTF-8 byte span
+  が完全一致することを 検証する。対象 schema だけを含む fixture では request
+  body bytes 全体も完全一致させ、 複数 tool の fixture では安全な別 schema
+  の独立した正規化を妨げないことも確認する。 mixed
+  `string | object`、branch-level `required` / `additionalProperties` 等、
+  root-level の object 制約、および explicit な root `type`
+  があるケースを含める。
 - generic `/upstream/*` の absolute cross-origin、absolute
   same-provider、relative `Location` を含む 302 / 307 response は、`502`
   の安定したエラーとなり、`Location` が downstream に返らず、追加 fetch や認証
