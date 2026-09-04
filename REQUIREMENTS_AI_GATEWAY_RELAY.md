@@ -188,6 +188,15 @@
       body を生成せず、元の body bytes をそのまま upstream
       へ転送して正規化をスキップする。丸め・切り捨て・指数表記の変更などの
       silent data corruption は許容しない。
+  - **route-specific な schema normalizer policy**:
+    - provider preset は、対象 route を OpenAI `/v1/chat/completions` または
+      Anthropic `/v1/messages` の明示的な policy に解決してから schema
+      normalizer へ渡す。normalizer は body 内で検出した
+      `anyOf`、`input_schema`、`function.parameters` 等の member 名だけから
+      provider policy を推測してはならない。
+    - OpenAI policy は `tools[].function.parameters` のみを対象とし、Anthropic
+      policy は `tools[].input_schema` のみを対象とする。片方の policy の
+      compatibility flatten 規則を他方へ適用してはならない。
   - **OpenAI route の `anyOf` 互換性変換（意図的な意味の狭め込み）**:
     - OpenAI の `/v1/chat/completions` にある `tools[].function.parameters`
       の対象 schema の root に `anyOf`
@@ -266,7 +275,12 @@
   - `/v1/responses` と `/upstream/*` の共通 upstream fetch は
     `RequestInit.redirect: "manual"` を指定し、relay 自身が upstream の redirect
     を自動取得しない。
-  - 新規の `/upstream/*` 経路では、upstream のすべての 3xx（`Location` の絶対
+  - 新規の `/upstream/*` 経路では、upstream の `304 Not Modified` は redirect
+    ではないため、サニタイズ後の response headers、status、body を pass-through
+    する。conditional request に使用される `If-None-Match` と
+    `If-Modified-Since` は denylist に含めず、upstream へ保持・転送する。
+  - 新規の `/upstream/*` 経路では、`300`、`301`、`302`、`303`、`305`、`306`、
+    `307`、`308` を含む `304` 以外のすべての 3xx（`Location` の絶対
     cross-origin、絶対 same-provider、相対 URL を含む）を `502` と
     `{"error":"upstream_redirect_not_allowed"}` に変換する。upstream の status、
     response headers（`Location` を含む）、body は downstream へ返さず、追加
@@ -409,11 +423,17 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
   `string | object`、branch-level `required` / `additionalProperties` 等、
   root-level の object 制約、および explicit な root `type`
   があるケースを含める。
-- generic `/upstream/*` の absolute cross-origin、absolute
-  same-provider、relative `Location` を含む 302 / 307 response は、`502`
-  の安定したエラーとなり、`Location` が downstream に返らず、追加 fetch や認証
-  header の別 origin 送信がないことを検証する。 307 の最初の POST body
-  は一度だけ upstream に届くことを検証する。
+- generic `/upstream/*` の upstream mock が `300`、`301`、`302`、`303`、`305`、
+  `306`、`307`、`308`（absolute cross-origin、absolute same-provider、relative
+  `Location` と body 付き）を返した場合、`502` の安定したエラーとなり、
+  `Location`、upstream headers/body が downstream に返らず、追加 fetch や認証
+  header の別 origin 送信がないことを検証する。各 status の upstream fetch call
+  count は `1` とし、307/308 の最初の POST body は一度だけ upstream に届くことを
+  検証する。
+- generic `GET /upstream/command-code/v1/models` が `If-None-Match` または
+  `If-Modified-Since` を付けて upstream へ送られ、upstream の `304 Not Modified`
+  の status、サニタイズ後の headers、body が downstream へ pass-through される
+  ことを検証する。upstream fetch call count は `1` とする。
 - legacy `/v1/responses` は既存の redirect pass-through
   契約を維持することを別テストで 検証する。
 - config loader は env 未設定、正の整数

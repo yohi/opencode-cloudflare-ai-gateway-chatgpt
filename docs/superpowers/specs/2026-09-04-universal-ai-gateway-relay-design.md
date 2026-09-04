@@ -91,9 +91,9 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取り、`config.ts` の検証済み timeout を依存注入 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、provider-compatible route として定義された POST + `application/json` 時の lossless body scan/transform と route-specific な OpenAI / Anthropic schema 正規化、upstream URL 構築。既知 route の JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。未知の route/method、または envelope 未定義 route は JSON parse せず body を raw forward する。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
-| `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。3xx の response policy は route ごとに分け、generic route は拒否、legacy route は互換 pass-through とする |
-| `schema.ts` | route に対応する `tools[].function.parameters` または `tools[].input_schema` の正規化実装 |
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、provider-compatible route として定義された POST + `application/json` 時の lossless body scan/transform と route policy に基づく OpenAI / Anthropic schema 正規化、upstream URL 構築。既知 route の JSON パース失敗時は route-specific な provider-compatible error envelope を `400` で返し、`forward.ts` を呼び出さない。未知の route/method、または envelope 未定義 route は JSON parse せず body を raw forward する。既知の `command-code` route では OpenAI / Anthropic の error shape を使い、universal な relay error envelope は返さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。generic upstream の `304` 以外の 3xx は `502 {"error":"upstream_redirect_not_allowed"}` に変換し、`Location` を透過しない |
+| `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にする。generic route は `304` を pass-through し、それ以外の 3xx を拒否する。legacy route は既存の 3xx を互換 pass-through する |
+| `schema.ts` | provider preset から明示的に渡された route policy に従い、OpenAI の `tools[].function.parameters` または Anthropic の `tools[].input_schema` を正規化する。provider policy を body member 名から推測しない |
 | `config.ts` | `UPSTREAM_HEADER_TIMEOUT_MS` と `SSE_IDLE_TIMEOUT_MS` を既定値・範囲付き整数 milliseconds として parse し、不正値で fail-closed にする |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
 
@@ -122,7 +122,7 @@ apps/deno-relay/
                              ├─ 未知 route/method または envelope 未定義 → JSON parse せず raw forward
                              ├─ 既知 route に対応する tools schema を schema.ts で正規化
                              ├─ containment 検証済みの upstream URL と query を forward
-                             └─ forward.ts で `redirect: "manual"` を指定し、generic の 3xx を拒否
+                             └─ forward.ts で `redirect: "manual"` を指定し、generic の 304 以外の 3xx を拒否
 ```
 
 ### 4.2 認証
@@ -149,7 +149,11 @@ apps/deno-relay/
 - upstream URL の containment 検証が完了するまで provider credential を転送しない
 - upstream 応答ヘッダーのサニタイズ
 - upstream fetch では必ず `redirect: "manual"` を指定する（`/v1/responses` と `/upstream/*` 共通）。
-- `/upstream/*` では upstream のすべての 3xx を追加 fetch せず、`502` と
+- `/upstream/*` では upstream の `304 Not Modified` を redirect とみなさず、
+  サニタイズ後の response headers、status、body を pass-through する。
+  `If-None-Match` と `If-Modified-Since` は denylist に含めず、upstream へ保持・転送する。
+- `/upstream/*` では `300`、`301`、`302`、`303`、`305`、`306`、`307`、`308` を含む
+  `304` 以外のすべての 3xx を追加 fetch せず、`502` と
   `{"error":"upstream_redirect_not_allowed"}` に変換する。upstream の status、response
   headers（`Location` を含む）、body は downstream へ返さない。
 - `/v1/responses` では既存互換のため、3xx の status、サニタイズ後の response headers
@@ -179,6 +183,11 @@ route pathname を API request shape の主な識別子とし、対象 schema me
 |---|---|---|
 | `/upstream/<provider-slug>/v1/chat/completions` | OpenAI の `type: "function"`、`function` オブジェクト、`parameters` schema object | `tools[].function.parameters` |
 | `/upstream/<provider-slug>/v1/messages` | Anthropic Messages の client tool shape（`name` と `input_schema` object） | `tools[].input_schema` |
+
+provider preset は route を明示的な normalization policy に解決してから `schema.ts` に
+渡す。normalizer は `anyOf`、`input_schema`、`function.parameters` 等の body member 名
+だけから provider policy を推測してはならない。OpenAI policy では root `anyOf` の
+safe flatten を許可するが、Anthropic policy では root `anyOf` を常に保持する。
 
 OpenAI route で `input_schema` を、Anthropic route で `function.parameters` を検出した
 だけでは変換しない。`input_schema` を持たない Anthropic server tool、上記以外の
@@ -316,7 +325,8 @@ schema の意味を維持するため `tools[].input_schema` の root `anyOf` �
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
 | 既知 provider route のリクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | `command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
 | envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
-| generic `/upstream/*` の upstream 3xx | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
+| generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers/body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
+| generic `/upstream/*` の upstream `304` 以外の 3xx（`300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`） | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
 | upstream 接続・ヘッダー応答タイムアウト | `504` | `{"error":"upstream_connect_or_header_timeout"}` | 既定 30 秒 |
 | SSE アイドルタイムアウト | stream error | `upstream_sse_idle_timeout` | 既定 120 秒 |
 | その他の upstream fetch エラー | 伝播または pass-through | - | - |
@@ -439,7 +449,8 @@ route/request shape を混同しない別ケースとして扱う。
 - containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
-- generic `/upstream/*` の upstream mock が 302 または 307（`Location` と body 付き）を返した場合に、`502` / `{"error":"upstream_redirect_not_allowed"}` へ変換し、`Location`、upstream headers、body を返さず、追加 fetch を行わないこと（upstream fetch call count は 1）
+- generic `/upstream/*` の upstream mock が `300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`（`Location` と body 付き）を返した場合に、`502` / `{"error":"upstream_redirect_not_allowed"}` へ変換し、`Location`、upstream headers、body を返さず、追加 fetch を行わないこと（各 status の upstream fetch call count は 1）
+- generic `GET /upstream/command-code/v1/models` が `If-None-Match` または `If-Modified-Since` を upstream へ転送し、upstream mock の `304 Not Modified` の status、サニタイズ後の headers、body を downstream へ pass-through すること（upstream fetch call count は 1）
 - generic `/upstream/*` で absolute cross-origin、absolute same-provider、relative の各 `Location` を拒否し、クライアントが Gateway 外へ follow できる `Location` を downstream に返さないこと
 - generic `/upstream/*` の 307 POST で、元の body が最初の upstream request に一度だけ届き、redirect 先への二度目の request や認証 header の別 origin 送信がないこと
 - legacy `/v1/responses` の upstream mock が 302 / 307 を返した場合に、既存互換どおり status・サニタイズ後の `Location` を含む headers・body を pass-through すること
@@ -552,7 +563,7 @@ route/request shape を混同しない別ケースとして扱う。
 1. `apps/deno-relay/relay.ts` を `forward.ts` / `router.ts` / `chatgpt.ts` / `upstream.ts` / `schema.ts` / `config.ts` / `types.ts` に再編成
 2. `main.ts` を新しい構成に対応させ、`config.ts` の検証済み timeout を dependency injection する
 3. `schema_test.ts` と `config_test.ts` を新規作成
-4. `relay_test.ts` を拡張し、generic 3xx 拒否と legacy redirect 互換を分けて検証
+4. `relay_test.ts` を拡張し、generic の `304` pass-through、`304` 以外の 3xx 拒否、および legacy redirect 互換を分けて検証
 5. 既存の `deno test apps/deno-relay` / `deno lint` / `deno fmt --check` がすべて通ることを確認
 6. Deno Deploy 側で `RELAY_SECRET` を設定済みであることを確認し、timeout env は定義する場合に仕様の範囲内で設定する
 7. Cloudflare AI Gateway の `command-code` Custom Provider の `base_url` を `https://<relay-domain>.deno.dev/upstream/command-code/` に変更

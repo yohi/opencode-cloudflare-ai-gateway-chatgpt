@@ -1,73 +1,95 @@
-# Universal AI Gateway Relay anyOf Contract Fix Implementation Plan
+# Universal AI Gateway Relay Contract Fix Implementation Plan
 
 > **For agentic workers:** Execute this plan inline in the current session. Do not dispatch subagents.
 
-**Goal:** Make unsafe root-level `anyOf` handling consistent with the no-semantic-corruption contract before relay implementation begins.
+**Goal:** Align the universal relay's documented status policy and provider-specific schema normalization contract with the validated review findings before the universal relay implementation begins.
 
-**Architecture:** Keep safe `anyOf` flattening and ordinary `type`/`properties` completion unchanged. When a target schema contains an `anyOf` that cannot be safely flattened, skip every schema normalization for that target schema and preserve its original body byte span. Independent safe target schemas in the same request may still be normalized. Document and test this decision consistently in the requirements, detailed design, and README.
+**Architecture:** Keep the existing legacy `POST /v1/responses` behavior unchanged. The future generic relay will pass through upstream `304 Not Modified` responses, reject every other 3xx status without following it, and retain conditional request headers. Its schema normalizer will receive the provider route shape explicitly: OpenAI may use the existing safe root `anyOf` flattening, while Anthropic preserves root `anyOf` schemas byte-for-byte. This change updates the requirements, design, README, and implementation plan only; it does not add generic relay runtime code that is not yet present.
 
-**Tech Stack:** Markdown design documents, Deno relay test strategy.
+**Tech Stack:** Markdown requirements and design documents, Deno relay test strategy, GitHub-flavored Markdown.
 
 ## Global Constraints
 
-- Preserve the existing legacy `POST /v1/responses` contract.
+- Preserve the existing legacy `POST /v1/responses` contract, including redirect pass-through.
+- For generic `/upstream/*`, set `RequestInit.redirect` to `"manual"`, pass through `304`, and reject all other 3xx statuses with the stable `502` error envelope.
+- Retain `If-None-Match` and `If-Modified-Since`; do not introduce a cache or redirect follow.
+- Apply root `anyOf` flattening only to the OpenAI `/v1/chat/completions` schema shape.
+- Preserve Anthropic `/v1/messages` root `anyOf` schemas, including all members and request-body byte spans, without normalization.
 - Keep generic relay behavior fail-closed and avoid direct ChatGPT fallbacks, retry loops, caching, and payload persistence.
 - Keep `apps/deno-relay` free of runtime dependencies.
 - Preserve raw/token-level bytes outside explicitly normalized schema spans.
-- Do not add relay implementation ahead of the design-only scope.
+- Do not add relay implementation ahead of the existing design-only scope.
 
 ---
 
-### Task 1: Define the unsafe `anyOf` normalization contract
+### Task 1: Fix the generic response status contract
 
 **Files:**
-- Modify: `REQUIREMENTS_AI_GATEWAY_RELAY.md:171-200`
-- Modify: `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md:199-221`
+- Modify: `REQUIREMENTS_AI_GATEWAY_RELAY.md:265-280, 394-445`
+- Modify: `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md:139-160, 309-337, 431-445`
+- Modify: `README.md:128-164`
 
 **Interfaces:**
-- Consumes: Existing safe-flatten conditions and `type`/`properties` completion rules.
-- Produces: A single rule stating that an unflattened root `anyOf` skips all normalization for that target schema.
+- Consumes: Existing route-specific redirect policy and `RequestInit.redirect: "manual"` requirement.
+- Produces: One status policy for all future generic relay implementations and tests.
 
-- [x] **Step 1: Rewrite both normalization sections**
+- [x] **Step 1: Define the status partition**
 
-  State that `type: "object"` and `properties: {}` completion occurs only when the target schema has no root `anyOf`, or after the root `anyOf` has passed the safe-flatten decision. If a root `anyOf` fails that decision, retain the complete target schema and its body byte span unchanged; do not add, remove, or rewrite any member.
+  State that generic `/upstream/*` passes through upstream `304 Not Modified`, including sanitized response headers and body. State that generic `/upstream/*` converts every other 3xx status, including `300`, `301`, `302`, `303`, `305`, `306`, `307`, and `308`, to `502 {"error":"upstream_redirect_not_allowed"}` without forwarding upstream headers/body or performing another fetch. Keep legacy `/v1/responses` 3xx pass-through unchanged.
 
-- [x] **Step 2: Add the mixed-type counterexample to both contracts**
+- [x] **Step 2: Define conditional-request behavior**
 
-  Include a concise example where `anyOf` contains `type: "string"` and `type: "object"`, explaining that adding a root `type: "object"` would invalidate the string branch.
+  State that `If-None-Match` and `If-Modified-Since` are ordinary request headers and are not removed by the relay's denylist. Add the `GET /upstream/command-code/v1/models` conditional request case to the integration test strategy, asserting one upstream fetch and a downstream `304` with the validator response preserved.
 
-### Task 2: Align test strategy and README
+- [x] **Step 3: Add the complete status matrix**
+
+  Update the design error table and requirements test list so that the generic cases cover `300`, representative redirect statuses (`301`, `302`, `303`, `307`, `308`), `304` pass-through, absolute cross-origin/same-provider and relative `Location`, and the legacy `302`/`307` compatibility exception.
+
+### Task 2: Make schema normalization route-explicit
 
 **Files:**
-- Modify: `REQUIREMENTS_AI_GATEWAY_RELAY.md:344-361`
-- Modify: `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md:369-464`
-- Modify: `README.md:130-149`
+- Modify: `REQUIREMENTS_AI_GATEWAY_RELAY.md:191-240, 394-474`
+- Modify: `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md:94-96, 175-233, 394-429`
+- Modify: `README.md:130-144`
 
 **Interfaces:**
-- Consumes: The unified unsafe `anyOf` rule from Task 1.
-- Produces: Test cases and user-facing documentation that distinguish safe flattening, unsafe no-op behavior, and ordinary completion.
+- Consumes: Existing OpenAI safe-flatten rules, Anthropic no-flatten rules, and raw/token-preserving body contract.
+- Produces: A route-explicit normalizer contract that a future `schema.ts` implementation can consume without inferring provider behavior from detected member names.
 
-- [x] **Step 1: Strengthen schema test cases**
+- [x] **Step 1: Name the route policy**
 
-  Require complete no-op behavior for mixed-type `anyOf`, branch-constrained `anyOf`, root-constrained `anyOf`, and explicit-root-type cases. Require UTF-8 raw-byte equality for the skipped target schema span, not only deep equality after parsing. A fixture containing only that target schema must preserve the entire body; a multi-tool fixture must not prevent independent safe schemas from being normalized.
+  Require the future normalizer to receive the recognized route policy from the provider preset. The policy must select exactly one target member: OpenAI `/v1/chat/completions` selects `tools[].function.parameters` and allows safe root `anyOf` flattening; Anthropic `/v1/messages` selects `tools[].input_schema` and never allows root `anyOf` flattening.
 
-- [x] **Step 2: Update README relay behavior**
+- [x] **Step 2: Preserve Anthropic root `anyOf` completely**
 
-  Document that generic route normalization does not add `type` or `properties` when a root `anyOf` is not safely flattenable, preventing the README from implying unconditional completion.
+  State that an Anthropic target schema containing root `anyOf` skips `type` and `properties` completion as well as flattening. The `anyOf`, every branch, every schema member, and the corresponding UTF-8 request-body byte span must remain unchanged. A route that only contains an `input_schema` member must not be normalized through the OpenAI policy.
 
-### Task 3: Verify the documentation-only change
+- [x] **Step 3: Bound OpenAI fallback behavior**
+
+  State that an OpenAI root `anyOf` is flattened only after all existing safety conditions pass. If it cannot be flattened, skip the whole target schema normalization, including `type` and `properties` completion, while allowing independent safe target schemas in the same body to be normalized.
+
+- [x] **Step 4: Expand the schema test strategy**
+
+  Require separate OpenAI and Anthropic fixtures for safe root `anyOf`, mixed `string | object` root `anyOf`, branch/root constraints, explicit root `type`, route-shape mismatch, and raw UTF-8 byte equality. Keep ordinary `type`/`properties` completion tests for both routes only when root `anyOf` is absent.
+
+### Task 3: Verify and publish the documentation contract fix
 
 **Files:**
-- Test: `apps/deno-relay/*_test.ts`
+- Test strategy references: `apps/deno-relay/*_test.ts`
+- Verify: `REQUIREMENTS_AI_GATEWAY_RELAY.md`, `README.md`, `docs/superpowers/specs/2026-09-04-universal-ai-gateway-relay-design.md`, this plan
 
-- [x] **Step 1: Run relay tests and static checks**
+- [x] **Step 1: Search for stale contradictory wording**
 
-  Run `deno test apps/deno-relay`, `deno fmt --check apps/deno-relay`, and `deno lint`.
+  Search the tracked Markdown files for generic `all 3xx` wording and provider-agnostic `anyOf` flattening wording. Replace every occurrence that contradicts the `304` exception or route-explicit schema policy; do not alter unrelated legacy compatibility text.
 
-- [x] **Step 2: Inspect the final diff and repository status**
+- [x] **Step 2: Run repository verification**
 
-  Confirm that only the plan and intended documentation files changed, with no relay source implementation added.
+  Run `deno test apps/deno-relay`, `deno fmt --check`, `deno lint`, `npm ci --legacy-peer-deps`, `npm run typecheck`, `npm test`, and `npm run build`. Record protected acceptance as not run if its required environment variables or credentials are unavailable. The full repository `deno fmt --check` may still report unrelated unformatted workspace files; the intended Markdown files must be checked separately and the unrelated files must not be changed as part of this fix.
 
-- [ ] **Step 3: Commit and push the documentation fix**
+- [x] **Step 3: Inspect intended changes only**
 
-  After checking `git status`, `git diff`, and recent history, create one Japanese Conventional Commit containing the plan and documentation updates, then push the current feature branch without force.
+  Review `git status`, `git diff`, and `git log --oneline -10`. Stage only the four intended tracked Markdown files and leave unrelated untracked files such as `.gitignore`, `REQUIREMENTS_2026-08-20.md`, `packages/opencode-plugin/dist/`, and `packages/opencode-plugin/node_modules/` untouched.
+
+- [x] **Step 4: Commit and push the contract fix**
+
+  Create one Japanese Conventional Commit for the requirements/design contract correction, then push the current feature branch without force. Do not commit directly to `master` and do not merge a pull request.

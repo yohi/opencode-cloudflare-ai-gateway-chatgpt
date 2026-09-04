@@ -127,9 +127,10 @@ https://chatgpt.com/backend-api/codex/responses
 
 さらに、リクエストの `Connection` ヘッダーを case-insensitive な comma-separated token list として解析し、そのリストに挙げられた各ヘッダーも除去します。応答ヘッダーについても同様に `Connection` とその token に挙げられた名前、および標準 hop-by-hop ヘッダーを除去します。残りの upstream 応答ヘッダー、status、body stream は保持されます。
 
-汎用経路では、provider preset が provider-compatible route として定義した `POST` かつ
-`Content-Type` の media type が `application/json` の場合に限り、body の raw/token-preserving
-scan で route に対応する tool schema を正規化します。OpenAI の
+汎用経路では、provider preset が provider-compatible route として定義した route policy に
+解決した `POST` かつ `Content-Type` の media type が `application/json` の場合に限り、body
+の raw/token-preserving scan で route policy に対応する tool schema を正規化します。
+normalizer は body member 名から provider policy を推測しません。OpenAI の
 `/v1/chat/completions` では `tools[].function.parameters`、Anthropic の
 `/v1/messages` では `tools[].input_schema` のみを対象とし、別の route/request shape
 は変更しません。`messages` 等の対象外フィールドと JSON number token は保持します。
@@ -156,7 +157,10 @@ JSON parse を行わず body を raw forward します。その route を provid
 既存の `/v1/responses` はこの解析を行いません。
 
 汎用経路の upstream `401`、`403`、`429`、`5xx` および通常の response は pass-through
-します。upstream の 3xx は、absolute cross-origin、absolute same-provider、relative
+します。upstream の `304 Not Modified` も redirect ではないため、status、サニタイズ後の
+headers、body を pass-through します。`If-None-Match` と `If-Modified-Since` は denylist
+に含めず、upstream へ保持・転送します。`304` 以外の `3xx`（`300`、`301`、`302`、`303`、
+`305`、`306`、`307`、`308`）は、absolute cross-origin、absolute same-provider、relative
 な `Location` を問わず `502 {"error":"upstream_redirect_not_allowed"}` に変換し、
 `Location`、upstream headers/body、追加 fetch を downstream へ返しません。既存
 `/v1/responses` は後方互換のため、従来どおり 3xx の status、サニタイズ後の headers
