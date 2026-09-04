@@ -103,6 +103,11 @@
   - query string は incoming URL の `search` として pathname
     から分離して保持し、path の URL 解決には使用しない。正常な query string は
     upstream へ透過する。
+  - raw request-target を URL normalization 前に取得し、最初の `?` で path と
+    query を 分離して containment を検証する。raw 値を取得できない、または
+    normalization 前の値と 一致することを証明できない場合は `404`
+    とし、`/./`、`/../`、percent-encoded dot segment、encoded separator を含む
+    suffix では provider Authorization 付き upstream fetch を実行しない。
   - **クライアント path の正準化**: `/upstream/command-code/` 以降には upstream
     API の完全な path
     を渡し、`/v1/chat/completions`、`/v1/messages`、`/v1/models` のように `/v1`
@@ -182,6 +187,19 @@
       `/v1/messages` では
       `{"type":"error","error":{"type":"invalid_request_error","message":"Request body exceeds maximum normalization size"}}`
       を返す。secret、credential、body 内容を含めてはならない。
+    - body buffering 前に固定最大 `16` の normalization slot
+      を非待機で取得する。slot が ない場合は reader
+      を消費せず、`503 {"error":"normalization_capacity_exhausted"}` を
+      返す。reader は `request.signal` と固定 30 秒の body timeout
+      に連動させ、abort/timeout および既知の `Content-Length` による早期 `413`
+      では reader を cancel する。
+    - parse failure、413、body timeout、client abort、upstream error、response
+      completion の全経路で normalization slot を一度だけ解放する。
+    - `tools`、`tools[].function`、`tools[].function.parameters`、`tools[].input_schema`
+      の対象 member が同一 object scope に重複する場合、effective member
+      を推測せず route-specific な
+      `400`（`duplicate_json_member`）を返し、normalization/upstream fetch
+      を実行しない。scanner と normalizer は同じ raw member spans を使用する。
     - counted reader が上限以下で完了した body だけを lossless scanner/transform
       に渡す。 上限ちょうどの body は許可し、`4 MiB + 1` byte
       は拒否する。`Content-Length` は 上限超過の早期拒否にだけ使用し、実 body の
@@ -429,10 +447,11 @@ milliseconds でなければならず、許容範囲は `1` 以上 `3_600_000`
 と SSE idle timeout の各処理へ到達することを検証可能にする。`RELAY_SECRET`
 が未設定の場合の既存の `503` 契約は変更しない。
 
-`RELAY_SECRET` は `undefined`、空文字列、または ASCII whitespace
-のみの値を設定エラー として扱い、`Deno.serve` を開始しない。存在確認では前後の
-whitespace を trim するが、 有効な secret
-の値自体を暗黙に変更せず、診断には値を出力しない。
+`RELAY_SECRET` は既存互換契約を維持し、`undefined`、空文字列、または ASCII
+whitespace のみの場合は request-time に `503 Service unavailable`
+を返す。起動時に secret の値を
+診断へ出力したり、空白を暗黙に除去した値へ変更したりしてはならない。timeout
+の設定エラー だけが `Deno.serve` を開始しない fail-closed 起動失敗となる。
 
 `MAX_NORMALIZATION_BODY_BYTES` は環境変数ではなく、`4 * 1024 * 1024`（4 MiB）の
 固定実装値とする。正規化対象 route の body

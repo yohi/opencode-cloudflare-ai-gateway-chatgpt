@@ -162,6 +162,11 @@ apps/deno-relay/
 - generic route の `Location` が absolute cross-origin、absolute same-provider、relative
   のいずれであっても拒否する。`307` / `308` でも、元の POST body は最初の upstream
   request に 1 回だけ送られ、relay は redirect 先へ再送しない。
+- router は runtime が提供する raw request-target を URL normalization 前に取得し、最初の `?`
+  で path と query を分離してから path suffix の containment を検証する。raw request-target を
+  取得できない、または normalization 前の値と一致することを証明できない場合は `404 Not Found`
+  として upstream fetch を行わない。`/./`、`/../`、percent-encoded dot segment、encoded
+  separator を含む suffix は URL constructor による解決結果ではなく raw path 上で拒否する。
 - SSE 応答の場合、120 秒のアイドルタイムアウトを適用
 - upstream fetch の header timeout は応答ヘッダー受信時に停止し、SSE idle timeout は
   その時点から開始して各 body chunk の受信ごとにリセットする。header timeout が
@@ -187,6 +192,12 @@ apps/deno-relay/
   読み、実際の累計が上限を超える次の chunk を検出した時点で reader を cancel し、部分 body を
   upstream へ渡さない。上限ちょうどは許可し、`4 MiB + 1` byte は拒否する。実 body の byte
   counter の結果を常に正とし、`Content-Length` は超過の早期拒否にだけ使用する。
+- 認識済み normalization route の body は、body buffering 前に有限の normalization slot を取得し、
+  `request.signal` と固定の `NORMALIZATION_BODY_TIMEOUT_MS = 30_000`（30 秒）を reader の読み取りへ
+  伝播する。client abort または body timeout では reader を cancel し、upstream fetch 前に slot を
+  解放して終了する。既知の `Content-Length` による早期 `413` でも inbound reader を cancel する。
+  parse failure、413、body timeout、client abort、upstream fetch error、response completion の全経路で
+  slot を一度だけ解放する。
 
 route pathname を API request shape の主な識別子とし、対象 schema member は次のように
 固定する。
@@ -219,6 +230,10 @@ failure は provider-compatible envelope が定義された既知 route にだ�
   - `Number.MIN_SAFE_INTEGER` から `Number.MAX_SAFE_INTEGER` の範囲外にある整数リテラルは ECMAScript `number` に変換せず、不透明な文字列表現としてコピーする。`9007199254740993` と `9223372036854775807` を丸めずに保持できることを必須とする。
   - 無損失な変換結果を保証できない場合は、部分的に再シリアライズした body を upstream に送らず、元の body bytes をそのまま転送して正規化をスキップする。
   - scanner は JSON の文字列状態、escape（escaped quote、backslash、`\u0000` 形式を含む）、および nesting を追跡し、文字列中の `{`、`}`、`[`、`]`、`,`、`:`、`"tools"` を JSON 構文や member path として誤認してはならない。`tools`、`function`、`parameters`、`input_schema` の member path は JSON string escape を解釈して判定するが、元の key token bytes は変更しない。
+  - 認識済み route では、同一 object scope に `tools`、`tools[].function`、`tools[].function.parameters`、
+    または `tools[].input_schema` の対象 member が重複している場合、effective member を推測せず
+    route-specific な `400` JSON error（`duplicate_json_member`）を返し、normalization と upstream
+    fetch を行わない。scanner の重複検出と normalizer の対象選択は同じ raw member spans を使用する。
   - body の位置情報は元の UTF-8 body bytes に対する byte offset とし、JavaScript の UTF-16 code-unit index と混同してはならない。複数の置換 span は元の body に対する位置で計算し、右から左へ適用するか、先行置換による長さ変化を後続位置へ正しく反映する。
 
 1. **OpenAI route の `anyOf` 互換性変換（意図的な意味の狭め込み）**
@@ -339,6 +354,9 @@ schema の意味を維持するため `tools[].input_schema` の root `anyOf` �
 | upstream path の origin/pathname prefix containment 違反または検証不能 | `404` | `Not Found` | upstream fetch 前、fetch 0 回 |
 | 既知 provider route のリクエストボディ JSON パース失敗（空 body / body なしを含む） | `400` | route-specific provider-compatible error envelope | `command-code` の `/v1/chat/completions` は OpenAI shape、`/v1/messages` は Anthropic shape。upstream fetch 前に返す |
 | 既知 provider route の normalization body 上限超過 | `413` | route-specific provider-compatible error envelope | `MAX_NORMALIZATION_BODY_BYTES` を超えた時点で reader を cancel し、upstream fetch を実行しない |
+| normalization slot 上限到達 | `503` | `{"error":"normalization_capacity_exhausted"}` | 最大 `16` slot を body buffering 前に非待機取得し、reader を消費せず upstream fetch 前に返す |
+| normalization body timeout | `408` | `{"error":"request_body_timeout"}` | 固定 30 秒。reader を cancel し、upstream fetch 前に返す |
+| 認識済み route の JSON member 重複 | `400` | route-specific provider-compatible error envelope | `duplicate_json_member` として normalization/upstream fetch 前に返す |
 | envelope 未定義の route/method の malformed JSON | upstream へ raw forward | upstream の response | relay は JSON parse せず、universal な relay error envelope を生成しない |
 | generic `/upstream/*` の upstream `304 Not Modified` | upstream の status | upstream の sanitized headers/body | `If-None-Match` / `If-Modified-Since` を保持し、追加 fetch なし |
 | generic `/upstream/*` の upstream `304` 以外の 3xx（`300`、`301`、`302`、`303`、`305`、`306`、`307`、`308`） | `502` | `{"error":"upstream_redirect_not_allowed"}` | `Location`、upstream headers/body を返さず、追加 fetch なし |
@@ -372,9 +390,7 @@ route/method は JSON parse せず body を raw forward し、universal な
 | `SSE_IDLE_TIMEOUT_MS` | - | SSE アイドルタイムアウト（整数 milliseconds、`1` 以上 `3_600_000` 以下） | 120000 |
 
 `config.ts` の pure config loader は startup 時に両 timeout を parse する。環境変数が
-`undefined` の場合だけ既定値を使用し、空文字列は未設定とはみなさない。`RELAY_SECRET`
-は `undefined`、空文字列、または ASCII whitespace のみの値を設定エラーとする。存在確認
-では前後の whitespace を trim するが、有効な secret の値自体は暗黙に変更しない。前後の ASCII
+`undefined` の場合だけ既定値を使用し、空文字列は未設定とはみなさない。前後の ASCII
 whitespace を除去した値が `[1-9][0-9]*` に一致し、`1` 以上 `3_600_000` 以下の
 finite integer milliseconds であることを要求する。`0`、負数、符号付き表記、小数、
 `30s` 等の非数値、`NaN`、`Infinity`、上限超過値は設定エラーとする。
@@ -385,6 +401,11 @@ secret、credential、request body を含めない。`main.ts` は loader の結
 `upstreamHeaderTimeoutMs` / `sseIdleTimeoutMs` として handler に明示的に dependency
 injection し、handler は受け取った milliseconds を header timeout と SSE idle timeout
 の実処理へ伝播させる。`RELAY_SECRET` 未設定時の既存 `503` 契約は変更しない。
+
+`RELAY_SECRET` は既存互換契約を維持し、`undefined`、空文字列、または ASCII whitespace のみ
+の場合は request-time に `503 Service unavailable` を返す。起動時に secret の値を診断へ出力したり、
+空白を暗黙に除去した値へ変更したりしてはならない。timeout の設定エラーだけが `Deno.serve` を
+開始しない fail-closed 起動失敗となる。
 
 `MAX_NORMALIZATION_BODY_BYTES` は `4 * 1024 * 1024`（4 MiB）の固定実装値とする。上限超過時の
 `/v1/chat/completions` response は
@@ -420,7 +441,12 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - **基盤プラットフォーム**: Deno Deploy
 - **処理場所と CPU リスクの分離**: 大容量リクエストの JSON scan/transform は Deno Deploy relay で実行し、Cloudflare Workers Free の 10ms CPU 制限を relay の処理に持ち込まないこと。Deno Deploy の CPU 無制限を前提にせず、対象 plan/runtime の計測値と SLO で受け入れ判定する
 - **メモリ予算**: 1 リクエストの process/heap high-water を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno Deploy 共通の platform limit とは仮定しない
-- **正規化の同時実行制御**: 正規化対象 body の in-flight 数を有限の admission control で制限し、body buffering、scan state、patch assembly を含む aggregate process/heap high-water が target runtime の予算内に収まる最大同時実行数を固定すること。上限到達時は新しい body の buffering を開始せず、明示した overload response で fail-closed に拒否すること
+- **正規化の同時実行制御**: 正規化対象 body の最大 in-flight 数を `16` に固定し、body buffering 前に
+  slot を非待機で取得すること。slot がない場合は reader を消費せず、`503
+  {"error":"normalization_capacity_exhausted"}` を返す。body buffering、scan state、patch
+  assembly を含む aggregate process/heap high-water が target runtime の予算内に収まることを
+  benchmark で確認し、parse failure、413、body timeout、client abort、upstream error、response
+  completion の全経路で slot を一度だけ解放すること。最大値は環境変数で上書きしない。
 - **正規化 body のアプリケーション上限**: 認識済み provider-compatible JSON route の
   `MAX_NORMALIZATION_BODY_BYTES` を 4 MiB に固定する。4 MiB 以下での buffering、scan、patch
   assembly の process/heap high-water を target runtime で計測し、512 MB の保守的予算に対する
@@ -479,6 +505,16 @@ route/request shape を混同しない別ケースとして扱う。
   credential、body 内容を error response に含めないこと
 - root `type` が `"string"`、`"array"`、または複合型の配列である anyOf は flatten と補完を
   行わず、対象 schema を byte-for-byte 保持すること
+- `tools`、`tools[].function`、`tools[].function.parameters`、`tools[].input_schema` の
+  重複 JSON member を route ごとに検出し、`duplicate_json_member` の `400`、normalization
+  skip、upstream fetch call count `0` となること
+- body buffering 前の normalization slot 上限 `16` を超えた場合、reader を消費せず
+  `503 {"error":"normalization_capacity_exhausted"}` を返すこと。parse failure、413、body
+  timeout、client abort、upstream error、response completion の各経路で slot が一度だけ解放され、
+  後続 request が再利用できること
+- `Content-Length` が上限以下でも実 body が超過する場合、超過 chunk で reader を cancel し、
+  upstream fetch call count が `0` となること。固定 30 秒の slow body timeout と
+  `request.signal` の abort が upstream fetch 前に reader を cancel すること
 
 ### 9.2 relay_test.ts（既存を拡張）
 
@@ -488,6 +524,9 @@ route/request shape を混同しない別ケースとして扱う。
 - `/upstream/command-code/v1/messages` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/messages` 完全一致）
 - `/upstream/command-code//attacker.example/collect` と `/upstream/command-code///attacker.example/collect` が `404` となり、attacker への fetch が発生しないこと
 - `/upstream/command-code/../other`、`/upstream/command-code/./other`、および到達可能な percent-encoded dot segment/encoded separator が containment 違反として扱われ、異常ケースごとに upstream fetch call count が `0` であること
+- raw request-target が取得不能、または normalization 前の値と一致しない場合に `404` となり、
+  `/./`、`/../`、percent-encoded dot segment、encoded separator の各ケースで upstream fetch
+  call count が `0` であること
 - containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
