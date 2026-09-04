@@ -6,13 +6,13 @@
 
 Cloudflare AI Gateway は可観測性・ログ収集・認証集約のハブとして有用だが、リクエストボディの JSON スキーマを動的に書き換える機能を持たない。そのため、Moonshot AI 等のプロバイダに対して MCP サーバーが出力するルートレベルの `anyOf` や空の `properties: {}` が HTTP 400 で拒絶される課題がある。
 
-さらに、Cloudflare Workers Free プランの 10ms CPU 制限は、会話履歴が大容量化した際に JSON パース・シリアライズだけで超過するリスクがある。
+さらに、Cloudflare Workers Free プランの 10ms CPU 制限は、会話履歴が大容量化した際に JSON パース・シリアライズだけで超過するリスクがある。本設計では、この変換処理を Cloudflare Workers の実行範囲から Deno Deploy relay 側へ分離する。
 
 本設計は、既存の Deno Deploy リレーを **汎用 AI Gateway リレー** に拡張し、次の目的を達成することを目指す。
 
 1. 複数プロバイダ（OpenAI 互換 API）へのマルチアップストリーム転送
 2. `tools[].function.parameters` のスキーマ正規化
-3. Cloudflare Workers Free の CPU 制限を回避する Deno Deploy 基盤の活用
+3. Cloudflare Workers Free の CPU 制限の影響を受ける処理を Deno Deploy relay へ分離
 4. 既存 ChatGPT Codex 経路の後方互換維持
 
 ## 2. 設計原則
@@ -87,7 +87,7 @@ apps/deno-relay/
 | `main.ts` | `Deno.serve` 起動、`RELAY_SECRET` 等の環境変数を読み取って依存を構成 |
 | `router.ts` | HTTP method/path で振り分け、認証前に `404` を返す |
 | `chatgpt.ts` | 既存 `/v1/responses` 専用ハンドラ。固定 upstream `https://chatgpt.com/backend-api/codex/responses` へ転送 |
-| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/v1/`、path=`/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
+| `upstream.ts` | 汎用 `/upstream/<provider-slug>/*` ハンドラ。provider 解決、HTTP method のそのまま転送、POST + `application/json` 時の lossless body scan/transform とスキーマ正規化、upstream URL 構築。JSON パース失敗時は `400 {"error":"invalid_json_body"}` を返し、`forward.ts` を呼び出さない。path suffix は URL reference ではなく preset pathname に付加する path data として扱い、最終 URL の origin と固定 pathname prefix を検証する。containment 違反または検証不能時は `404` とし、upstream fetch を呼び出さない（例: base=`https://api.commandcode.ai/provider/`、path=`/v1/chat/completions` → `https://api.commandcode.ai/provider/v1/chat/completions`）。
 | `forward.ts` | 共通の upstream fetch、ヘッダー制御、SSE/非 SSE 応答転送、タイムアウト・キャンセル処理。`/v1/responses` と `/upstream/*` の全経路で `RequestInit.redirect` を `"manual"` にし、upstream の 3xx を追従せず透過する |
 | `schema.ts` | `tools[].function.parameters` の正規化実装 |
 | `types.ts` | `RelayDependencies`、`RelayTimer`、`RelayFetcher` 等の共有型 |
@@ -267,21 +267,31 @@ apps/deno-relay/
 
 | provider-slug | upstream base URL | クライアントからの path suffix 例 |
 |---|---|---|
-| `command-code` | `https://api.commandcode.ai/provider/v1/` | `/chat/completions`, `/messages`, `/models` |
+| `command-code` | `https://api.commandcode.ai/provider/` | `/v1/chat/completions`, `/v1/messages`, `/v1/models` |
 
-upstream URL は、path suffix を URL reference として解決せず、preset base URL の pathname に path data として付加して構築する。`command-code` の base URL は `/provider/v1/` で終わるため、relay route の `/upstream/command-code/` 以降には `/v1` を含めず、例えば `/chat/completions` を付加して `https://api.commandcode.ai/provider/v1/chat/completions` とする。
+upstream URL は、path suffix を URL reference として解決せず、preset base URL の pathname に path data として付加して構築する。`command-code` の base URL は `/provider/` で終わるため、relay route の `/upstream/command-code/` 以降には upstream API の完全な path を含め、例えば `/v1/chat/completions` を付加して `https://api.commandcode.ai/provider/v1/chat/completions` とする。
 
-構築後の upstream URL は、preset base URL と同じ `origin` であり、preset の固定 pathname prefix（`command-code` では `/provider/v1/`）配下であることを検証する。prefix の末尾 `/` は path segment boundary として扱う。`//` または `///` で始まる authority-like suffix、dot segment、percent-encoded dot segment、path segmentation を変え得る encoded separator、その他 containment を証明できない suffix は `404 Not Found` とし、provider の `Authorization` を付けた upstream fetch を実行しない。query string は incoming URL の `search` として分離して保持し、正常な値は変更せず upstream へ透過する。
+構築後の upstream URL は、preset base URL と同じ `origin` であり、preset の固定 pathname prefix（`command-code` では `/provider/`）配下であることを検証する。prefix の末尾 `/` は path segment boundary として扱う。`//` または `///` で始まる authority-like suffix、dot segment、percent-encoded dot segment、path segmentation を変え得る encoded separator、その他 containment を証明できない suffix は `404 Not Found` とし、provider の `Authorization` を付けた upstream fetch を実行しない。query string は incoming URL の `search` として分離して保持し、正常な値は変更せず upstream へ透過する。
+
+標準 SDK と Gateway path の対応は次のとおりとする。Cloudflare Custom Provider の `base_url` は relay の固定 route prefix `https://<relay>/upstream/command-code/` とし、`custom-{slug}/` 以降の完全な provider path を relay へ渡す。
+
+| クライアント | Gateway SDK base URL の終端 | SDK が付加する path | relay が受ける path |
+|---|---|---|---|
+| OpenAI SDK | `.../custom-command-code/v1` | `/chat/completions`、`/models` | `/upstream/command-code/v1/chat/completions`、`/upstream/command-code/v1/models` |
+| Anthropic SDK | `.../custom-command-code` | `/v1/messages`、`/v1/models` | `/upstream/command-code/v1/messages`、`/upstream/command-code/v1/models` |
+| raw HTTP client | `.../custom-command-code` | `/v1/...` | `/upstream/command-code/v1/...` |
 
 未知の `provider-slug` へのリクエストは `404 Not Found` を返す。
 
 ## 8. 非機能要件
 
 - **基盤プラットフォーム**: Deno Deploy
-- **CPU 制限回避**: Cloudflare Workers Free（10ms）と異なり、大容量リクエストの JSON パース・変換時にも CPU 枯渇エラー（1102）を起こさないこと
-- **メモリ使用量**: 512 MB 以内で安定稼働すること
+- **処理場所と CPU リスクの分離**: 大容量リクエストの JSON scan/transform は Deno Deploy relay で実行し、Cloudflare Workers Free の 10ms CPU 制限を relay の処理に持ち込まないこと。Deno Deploy の CPU 無制限を前提にせず、対象 plan/runtime の計測値と SLO で受け入れ判定する
+- **メモリ予算**: 1 リクエストの process/heap high-water を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno Deploy 共通の platform limit とは仮定しない
 - **ゼロ外部依存**: Deno 標準 API のみで実装する
-- **レイテンシオーバーヘッド**: リレー層における純粋な処理遅延（JSON パース＋変換＋ヘッダー処理）は 10ms 未満であること
+- **レイテンシオーバーヘッド SLO（初期値）**: 受信済み body bytes の scan/transform 開始から、upstream fetch を開始できる request body と header の準備完了までを計測区間とする。network 転送、upstream 待ち時間、cold start は含めない
+- **SLO の測定条件**: body size 700 KiB、1 MiB、2 MiB、4 MiB、warm な Deno Deploy instance、単一同時実行で p95 を測定する。JSON scan/transform と header 処理を合わせた p95 は各サイズで 10ms 未満を初期目標とする。これは Cloudflare または Deno Deploy の platform limit ではなく、測定可能な product SLO である
+- **benchmark の記録**: p50/p95/p99、body size、runtime/version、region、warm/cold 条件、concurrency、および process/heap high-water を記録する。SLO 判定は target Deno Deploy 環境で行い、ローカル実行結果だけで合否を決めない
 - **ステートレス設計**: DB や永続状態を持たない
 - **ログ**: 可観測性は Cloudflare AI Gateway に一元委託し、リレー側では機密ペイロードのログ出力を最小限に抑える
 
@@ -322,26 +332,26 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 
 以下を追加する統合テストを作成する。
 
-- `/upstream/command-code/chat/completions` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/chat/completions` 完全一致）
-- `/upstream/command-code/messages` への転送と upstream URL 検証
+- `/upstream/command-code/v1/chat/completions` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/chat/completions` 完全一致）
+- `/upstream/command-code/v1/messages` への転送と upstream URL 検証（`https://api.commandcode.ai/provider/v1/messages` 完全一致）
 - `/upstream/command-code//attacker.example/collect` と `/upstream/command-code///attacker.example/collect` が `404` となり、attacker への fetch が発生しないこと
 - `/upstream/command-code/../other`、`/upstream/command-code/./other`、および到達可能な percent-encoded dot segment/encoded separator が containment 違反として扱われ、異常ケースごとに upstream fetch call count が `0` であること
 - containment 検証に失敗する異常ケースで、`Authorization: Bearer <CMD_API_KEY>` が preset 外の target へ送られないこと
 - 既存 `/v1/responses` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - `/upstream/command-code/*` の upstream mock に渡される `RequestInit.redirect === "manual"` の検証
 - upstream mock が 302 または 307（`Location` と body 付き）を返した場合に、redirect 先を追加 fetch せず、status・`Location` を含む許可済み response headers・body を透過すること（upstream fetch call count は 1）
-- **GET `/upstream/command-code/models` の転送**: upstream mock で以下を assert する
+- **GET `/upstream/command-code/v1/models` の転送**: upstream mock で以下を assert する
   - `method === "GET"`
   - body なし（または `null` / `undefined`）
   - URL === `https://api.commandcode.ai/provider/v1/models`
   - `Authorization: Bearer <CMD_API_KEY>` がそのまま届く
   - `X-Relay-Authorization` は upstream に届かない
-- POST `/upstream/command-code/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で tools 正規化が行われること
-- POST `/upstream/command-code/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、body `{"error":"invalid_json_body"}`、upstream fetch call count `0` となること
+- POST `/upstream/command-code/v1/chat/completions` において、`Content-Type` の media type が `application/json`（パラメータ付き・type/subtype の大文字小文字違いを含む）なら lossless body scan/transform で tools 正規化が行われること
+- POST `/upstream/command-code/v1/chat/completions` に正しい `X-Relay-Authorization`、`Content-Type: application/json`、malformed JSON body を渡した場合、status `400`、body `{"error":"invalid_json_body"}`、upstream fetch call count `0` となること
 - `Content-Type: application/json; charset=utf-8` および type/subtype の大文字小文字違いでも、malformed JSON body は同じ `400` / `{"error":"invalid_json_body"}` となり、upstream fetch call count が `0` であること
 - POST + `application/json` の空 body（body なしを含む）は `400` / `{"error":"invalid_json_body"}` とし、upstream fetch call count が `0` であること
 - `text/plain` または不正な `Content-Type` では tools 正規化のための JSON パースを行わないこと
-- GET `/upstream/command-code/models` では body を JSON パースせず、そのまま転送されること
+- GET `/upstream/command-code/v1/models` では body を JSON パースせず、そのまま転送されること
 - HTTP method のそのまま転送（例: GET, POST）
 - query string の保持
 - `/provider/v1/v1/...` が生成されない回帰テスト
@@ -362,6 +372,17 @@ upstream URL は、path suffix を URL reference として解決せず、preset 
 - 既存 `/v1/responses` テスト（SSE、header timeout、SSE idle timeout、client abort、header sanitization を含む）の維持
 - `/v1/responses` が `X-ChatGPT-Relay-Authorization` のみを受け付けること
 - `/v1/responses` が `Authorization` / `X-Relay-Authorization` を受け付けないこと（推奨、省略可）
+
+### 9.3 performance_test.ts（新規）
+
+以下を target Deno Deploy 環境とローカルの比較用 benchmark で測定する。
+
+- 700 KiB、1 MiB、2 MiB、4 MiB の body fixture を用意し、巨大な `messages` と変換対象の `tools` を同一 body に含めること
+- body bytes が受信済みの状態から scan/transform、patch assembly、request header の準備完了までを計測し、network 転送、upstream fetch、cold start を計測区間から除外すること
+- warmup 後の単一同時実行を基本条件とし、p50/p95/p99 と process/heap high-water をサイズごとに記録すること
+- 各サイズの p95 が 10ms 未満という初期 SLO と、1 リクエストの memory high-water が 512 MB のアプリケーション予算以内であることを target 環境の acceptance で判定すること
+- ローカル benchmark は実装比較と回帰検知に使い、Deno Deploy の plan/runtime/resource limit の代替証拠にはしないこと
+- 大容量 fixture の raw bytes、unsafe integer、UTF-8 byte offset、複数 patch の無損失性は `schema_test.ts` と `relay_test.ts` の機能テストでも引き続き検証すること
 
 ## 10. Future 拡張（Roadmap）
 

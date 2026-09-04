@@ -11,9 +11,9 @@
 2. **Cloudflare AI Gateway 単体でのスキーマ変換機能の欠如**
    - AI Gateway はリバースプロキシとしてログやキャッシュを提供するが、リクエストボディ（JSON Payload）の内部スキーマを動的に書き換える（Transformation）機能を持たない。
 3. **Cloudflare Workers Free プランの CPU 時間制限（10ms）のリスク**
-   - 会話履歴（`messages`）が長大化（700KB 〜 数MB）した場合、Cloudflare Workers の無料枠（CPU 10ms 制限）では JSON のパース・シリアライズだけで制限時間を超過し、タスク終盤でワーカーがクラッシュ（Error 1102）する致命的リスクがある。
+   - 会話履歴（`messages`）が長大化（700 KiB 〜 4 MiB）した場合、Cloudflare Workers の無料枠（CPU 10ms 制限）では JSON のパース・シリアライズだけで制限時間を超過し、タスク終盤でワーカーがクラッシュ（Error 1102）する致命的リスクがある。
 4. **個別リレー乱立の防止**
-   - 既存の `yohi/opencode-cloudflare-ai-gateway-chatgpt`（Deno Deploy 上の ChatGPT Codex 用リレー）が存在するが、ChatGPT 特化となっている。これを汎用化することで、CPU 制限のない Deno Deploy 基盤を活用し、複数プロバイダの非互換性を一元的に吸収するリレー基盤が必要とされている。
+   - 既存の `yohi/opencode-cloudflare-ai-gateway-chatgpt`（Deno Deploy 上の ChatGPT Codex 用リレー）が存在するが、ChatGPT 特化となっている。これを汎用化することで、大容量変換を Deno Deploy 側へ分離し、複数プロバイダの非互換性を一元的に吸収するリレー基盤が必要とされている。
 
 ---
 
@@ -64,13 +64,14 @@
 - **パスベースのマルチアップストリーム転送**:
   - `/upstream/<provider-slug>/*` のパス構造を解釈し、対応する上流エンドポイントへリバースプロキシする。
   - **プリセットプロバイダ定義**:
-    - `command-code`: `https://api.commandcode.ai/provider/v1/`
+    - `command-code`: `https://api.commandcode.ai/provider/`
     - 今後追加される任意の OpenAI 互換プロバイダ
 - **upstream URL の containment**:
   - プリセットの base URL は固定された絶対 URL として解釈する。クライアント由来の path suffix は URL reference として解決せず、プリセットの pathname に付加する path data として扱う。`new URL(suffix, base)` の relative/root/authority reference semantics に依存してはならない。
-  - 最終 upstream URL の `origin` はプリセット base URL の `origin` と完全一致し、`pathname` はプリセット base URL の固定 pathname prefix 配下でなければならない。prefix の末尾 `/` は path segment boundary として扱い、`command-code` では `/provider/v1/` 配下だけを許可する。
+  - 最終 upstream URL の `origin` はプリセット base URL の `origin` と完全一致し、`pathname` はプリセット base URL の固定 pathname prefix 配下でなければならない。prefix の末尾 `/` は path segment boundary として扱い、`command-code` では `/provider/` 配下だけを許可する。
   - URL の構築・解析・正規化後に containment を証明できない suffix、`//` または `///` で始まる authority-like suffix、dot segment、percent-encoded dot segment、または path segmentation を変え得る encoded separator は、上流 fetch 前に `404 Not Found` とする。
   - query string は incoming URL の `search` として pathname から分離して保持し、path の URL 解決には使用しない。正常な query string は upstream へ透過する。
+  - **クライアント path の正準化**: `/upstream/command-code/` 以降には upstream API の完全な path を渡し、`/v1/chat/completions`、`/v1/messages`、`/v1/models` のように `/v1` を含める。OpenAI SDK は base URL の `/v1` を前提に endpoint suffix を付加し、Anthropic SDK は `/v1` なしの base URL に対して自身で `/v1` を付加するため、relay は `/v1` を暗黙に削除・追加してはならない。
 - **後方互換性の維持**:
   - 既存の ChatGPT Codex 経路（`/v1/responses`）はそのまま維持し、`https://chatgpt.com/backend-api/codex/responses` へ転送する。
 - **未知のプロバイダへの対応**:
@@ -133,14 +134,17 @@
 
 ### 4.1 実行環境・リソース制約
 - **基盤プラットフォーム**: Deno Deploy
-  - **CPU 制限の回避**: Cloudflare Workers Free（10ms）と異なり、大容量リクエスト（数MB）の JSON パース・変換時にも CPU 枯渇エラー（1102）を起こさないこと。
-  - **メモリ使用量**: 512 MB 以内で安定稼働すること。
+  - **処理場所と CPU リスクの分離**: 大容量リクエストの JSON scan/transform は Deno Deploy relay で実行し、Cloudflare Workers Free の 10ms CPU 制限を relay の処理に持ち込まないこと。Deno Deploy の CPU 無制限を前提にせず、対象 plan/runtime の計測値と下記 SLO で受け入れ判定すること。
+  - **メモリ予算**: 1 リクエストの process/heap high-water を、保守的なアプリケーション予算 512 MB 以内かつ対象 plan/runtime の上限に対する安全余裕を確保した状態で安定稼働させること。512 MB を Deno Deploy 共通の platform limit とは仮定しない。
 - **ゼロ外部依存**:
   - Deno 標準 API（`Deno.serve`, `fetch`, `ReadableStream` 等）のみで実装し、メンテナンスコストを最小化する。
 
 ### 4.2 性能要件
-- **レイテンシオーバーヘッド**:
-  - リレー層における純粋な処理遅延（JSON パース＋変換＋ヘッダー処理）は 10ms 未満であること。
+- **レイテンシオーバーヘッド SLO（初期値）**:
+  - 受信済み body bytes の scan/transform 開始から、upstream fetch を開始できる request body と header の準備完了までを計測区間とする。network 転送、upstream 待ち時間、cold start は含めない。
+  - 対象 body size は 700 KiB、1 MiB、2 MiB、4 MiB とし、warm な Deno Deploy instance、単一同時実行で p95 を測定する。
+  - JSON scan/transform と header 処理を合わせた p95 は各サイズで 10ms 未満を初期目標とする。これは Cloudflare または Deno Deploy の platform limit ではなく、測定可能な product SLO である。
+  - benchmark は p50/p95/p99、body size、runtime/version、region、warm/cold 条件、concurrency、および process/heap high-water を記録する。SLO 判定は target Deno Deploy 環境で行い、ローカル実行結果だけで合否を決めない。
 
 ### 4.3 信頼性・観測性
 - **ステートレス設計**:
@@ -166,6 +170,10 @@
 - **設定ヘッダー**:
   - `X-Relay-Authorization: Bearer <RELAY_SECRET>`
   - 標準 `Authorization` ヘッダーは Command Code API key（`Authorization: Bearer <CMD_API_KEY>`）として Cloudflare から relay を経由して上流へ透過される。
+- **クライアント path**:
+  - OpenAI SDK の base URL は `.../custom-command-code/v1` とし、SDK が付加する `/chat/completions` により Gateway から relay へ `/upstream/command-code/v1/chat/completions` を到達させる。
+  - Anthropic SDK の base URL は `.../custom-command-code` とし、SDK が付加する `/v1/messages` により Gateway から relay へ `/upstream/command-code/v1/messages` を到達させる。
+  - models list は両 SDK とも `/v1/models` を使用し、relay から upstream の `https://api.commandcode.ai/provider/v1/models` へ転送する。
 
 ---
 
