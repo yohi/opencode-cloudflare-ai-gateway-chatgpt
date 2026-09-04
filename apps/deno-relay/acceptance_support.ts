@@ -51,9 +51,17 @@ function gatewayEndpoint(
   path: string,
 ): string {
   const base = new URL(config.gatewayBaseUrl);
+  const validGatewayPath = /^\/v1\/[^/]+\/[^/]+\/?$/;
   if (
-    base.protocol !== "https:" || base.search.length > 0 ||
-    base.hash.length > 0 || !path.startsWith("/")
+    base.protocol !== "https:" ||
+    base.hostname !== "gateway.ai.cloudflare.com" ||
+    base.port.length > 0 ||
+    base.username.length > 0 ||
+    base.password.length > 0 ||
+    base.search.length > 0 ||
+    base.hash.length > 0 ||
+    !validGatewayPath.test(base.pathname) ||
+    !path.startsWith("/")
   ) {
     throw new Error("invalid protected acceptance Gateway URL");
   }
